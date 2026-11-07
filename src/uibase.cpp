@@ -1,6 +1,19 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// uibase.cpp — wxFormBuilder 生成的控件构造与事件绑定
+//=============================================================================
+//
+// 【本文件功能】
+//   创建控件、组织 sizer、绑定虚事件；析构时断开连接。
+//
+// 【在整个系统中的作用】
+//   纯界面搭建代码。读业务请看 ui.cpp；本文件一般不必逐行阅读。
+//   重新生成 .fbp 可能覆盖此处，故只保留总览说明。
+//
+//=============================================================================
 
 ///////////////////////////////////////////////////////////////////////////
 // C++ code generated with wxFormBuilder (version Apr 16 2008)
@@ -438,7 +451,7 @@ CAboutDialogBase::CAboutDialogBase(wxWindow* parent, wxWindowID id, const wxStri
 
     bSizer63->Add(0, 4, 0, wxEXPAND, 5);
 
-    m_staticTextMain = new wxStaticText(this, wxID_ANY, wxT("Copyright © 2009 Satoshi Nakamoto.\n\nThis is experimental software.  Do not rely on it for actual financial transactions.\n\nDistributed under the MIT/X11 software license, see the accompanying file license.txt or http://www.opensource.org/licenses/mit-license.php.\n\nThis product includes software developed by the OpenSSL Project for use in the OpenSSL Toolkit (http://www.openssl.org/) and cryptographic software written by Eric Young (eay@cryptsoft.com)."), wxDefaultPosition, wxDefaultSize, 0);
+    m_staticTextMain = new wxStaticText(this, wxID_ANY, wxT("Copyright Â© 2009 Satoshi Nakamoto.\n\nThis is experimental software.  Do not rely on it for actual financial transactions.\n\nDistributed under the MIT/X11 software license, see the accompanying file license.txt or http://www.opensource.org/licenses/mit-license.php.\n\nThis product includes software developed by the OpenSSL Project for use in the OpenSSL Toolkit (http://www.openssl.org/) and cryptographic software written by Eric Young (eay@cryptsoft.com)."), wxDefaultPosition, wxDefaultSize, 0);
     m_staticTextMain->Wrap(400);
     bSizer63->Add(m_staticTextMain, 0, wxALL, 5);
 

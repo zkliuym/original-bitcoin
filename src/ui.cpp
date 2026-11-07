@@ -1,6 +1,35 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// ui.cpp — wxWidgets 界面实现与桌面应用入口
+//=============================================================================
+//
+// 【本文件功能】
+//   实现主窗口、发币/地址簿/选项等对话框，以及 CMyApp 启动流程；把用户
+//   操作接到钱包、网络与挖矿，并把后台结果刷新到界面。
+//
+// 【在整个系统中的作用】
+//   1. 进程入口：OnInit2 加载 addr/blkindex/wallet，创建主窗并 StartNode。
+//   2. 钱包交互：展示交易、构造付款、管理地址标签与默认密钥。
+//   3. 遗留能力：IP 直付（checkorder/submitorder）与早期市场窗口。
+//
+// 【启动路线图】（建议从后部 CMyApp::OnInit2 读起）
+//   1. OnInit 捕获异常 → OnInit2
+//   2. 单实例检查；解析 /datadir、/proxy、/debug、/gen 等
+//   3. 加载 addr.dat → 区块索引 → wallet.dat；重接纳未确认交易
+//   4. 创建 CMainFrame → StartNode → 按设置启动挖矿
+//   5. 进入 wx 事件循环
+//
+// 【付款路径】
+//   地址付款：CSendDialog::OnButtonSend → SendMoney
+//   IP 付款：CSendingDialog → checkorder → 组交易 → submitorder
+//
+// 【线程边界】
+//   控件仅 UI 线程访问；网络/挖矿经自定义 wx 事件与 Repaint 回投界面。
+//
+//=============================================================================
 
 #include "headers.h"
 #ifdef _MSC_VER
@@ -33,11 +62,12 @@ void RandSend();
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// Util
+// 通用 UI 辅助函数：格式化、列表访问、HTML 转义和商品列表插入
 //
 
 void HandleCtrlA(wxKeyEvent& event)
 {
+    // 旧版 wxWidgets 文本框未统一提供此快捷键，这里集中补上 Ctrl+A。
     // Ctrl-a select all
     wxTextCtrl* textCtrl = (wxTextCtrl*)event.GetEventObject();
     if (event.GetModifiers() == wxMOD_CONTROL && event.GetKeyCode() == 'A')
@@ -128,6 +158,7 @@ int GetSelection(wxListCtrl* listCtrl)
 
 string HtmlEscape(const char* psz, bool fMultiLine=false)
 {
+    // 交易附言和市场文本会嵌入 wxHtmlWindow，必须先转义用户提供的字符。
     int len = 0;
     for (const char* p = psz; *p; p++)
     {
@@ -180,12 +211,13 @@ void AddToMyProducts(CProduct product)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// Custom events
+// 自定义事件桥：把网络线程中的序列化回复安全投递给 wx UI 线程
 //
 
 set<void*> setCallbackAvailable;
 CCriticalSection cs_setCallbackAvailable;
 
+// 记录仍存活的事件接收者，避免异步回复投递到已经关闭的窗口。
 void AddCallbackAvailable(void* p)
 {
     CRITICAL_BLOCK(cs_setCallbackAvailable)
@@ -250,6 +282,7 @@ void AddPendingReplyEvent3(void* pevthandler, CDataStream& vRecv)
 
 CDataStream GetStreamFromEvent(const wxCommandEvent& event)
 {
+    // AddPendingCustomEvent 把字节暂存在 wxString 中；此处恢复网络数据流。
     wxString strData = event.GetString();
     return CDataStream(strData.begin(), strData.begin() + event.GetInt(), SER_NETWORK);
 }
@@ -262,11 +295,12 @@ CDataStream GetStreamFromEvent(const wxCommandEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CMainFrame
+// 主窗口：钱包交易列表、余额/连接状态，以及主要菜单和工具栏入口
 //
 
 CMainFrame::CMainFrame(wxWindow* parent) : CMainFrameBase(parent)
 {
+    // Base 类只创建控件；这里把控件接到钱包状态并填充第一屏数据。
     Connect(wxEVT_CROSSTHREADCALL, wxCommandEventHandler(CMainFrame::OnCrossThreadCall), NULL, this);
 
     // Init
@@ -342,6 +376,7 @@ CMainFrame::~CMainFrame()
 
 void Shutdown(void* parg)
 {
+    // 退出放在独立线程：先通知各循环停止，再按顺序刷写数据库和停止节点。
     static CCriticalSection cs_Shutdown;
     CRITICAL_BLOCK(cs_Shutdown)
     {
@@ -431,6 +466,8 @@ string FormatTxStatus(const CWalletTx& wtx)
 
 void CMainFrame::InsertTransaction(const CWalletTx& wtx, bool fNew, int nIndex)
 {
+    // 将链上交易模型“翻译”为用户看到的一行。收款、付款、自产币和混合交易
+    // 的金额/说明规则不同，因此这是主窗口最重要的显示适配函数。
     int64 nTime = wtx.nTimeDisplayed = wtx.GetTxTime();
     int64 nCredit = wtx.GetCredit();
     int64 nDebit = wtx.GetDebit();
@@ -620,6 +657,7 @@ void CMainFrame::InsertTransaction(const CWalletTx& wtx, bool fNew, int nIndex)
 
 void CMainFrame::RefreshStatus()
 {
+    // 确认数随最佳链变化；只更新当前可见窗口附近约 100 行以降低重绘成本。
     static int nLastTop;
     int nTop = m_listCtrl->GetTopItem();
     if (nTop == nLastTop && pindexBestLast == pindexBest)
@@ -659,12 +697,14 @@ void CMainFrame::RefreshStatus()
 
 void CMainFrame::RefreshListCtrl()
 {
+    // 只设置请求标志，完整扫描钱包由空闲事件完成。
     fRefreshListCtrl = true;
     ::wxWakeUpIdle();
 }
 
 void CMainFrame::OnIdle(wxIdleEvent& event)
 {
+    // 重建时先按交易时间生成排序键，再分批插入并 wxYield，防止大钱包冻结 UI。
     if (fRefreshListCtrl)
     {
         // Collect list of wallet transactions and sort newest first
@@ -739,6 +779,7 @@ void CMainFrame::OnPaint(wxPaintEvent& event)
 
 void CMainFrame::OnPaintListCtrl(wxPaintEvent& event)
 {
+    // 增量消费钱包线程留下的 vWalletUpdated，并同步状态栏和余额。
     // Update listctrl contents
     if (!vWalletUpdated.empty())
     {
@@ -798,6 +839,7 @@ void CrossThreadCall(int nID, void* pdata)
 
 void CMainFrame::OnCrossThreadCall(wxCommandEvent& event)
 {
+    // 预留的通用跨线程命令分发器；本版订单操作分支尚未实现。
     void* pdata = event.GetClientData();
     switch (event.GetInt())
     {
@@ -820,6 +862,8 @@ void CMainFrame::OnMenuFileExit(wxCommandEvent& event)
 
 void CMainFrame::OnMenuOptionsGenerate(wxCommandEvent& event)
 {
+    // 菜单勾选状态就是全局挖矿开关；开启时启动矿工线程，关闭由线程观察
+    // fGenerateBitcoins 后自行退出。设置同时写入 wallet 数据库。
     fGenerateBitcoins = event.IsChecked();
     nTransactionsUpdated++;
     CWalletDB().WriteSetting("fGenerateBitcoins", fGenerateBitcoins);
@@ -854,14 +898,14 @@ void CMainFrame::OnButtonSend(wxCommandEvent& event)
         return;
     }
 
-    // Toolbar: Send
+    // 普通工具栏入口只负责打开模态发送窗口，校验与付款均在对话框内完成。
     CSendDialog dialog(this);
     dialog.ShowModal();
 }
 
 void CMainFrame::OnButtonAddressBook(wxCommandEvent& event)
 {
-    // Toolbar: Address Book
+    // 地址簿的特殊返回值 2 表示用户要求把所选地址继续带入发送窗口。
     CAddressBookDialog dialogAddr(this, "", false);
     if (dialogAddr.ShowModal() == 2)
     {
@@ -899,6 +943,7 @@ void CMainFrame::OnButtonCopy(wxCommandEvent& event)
 
 void CMainFrame::OnButtonChange(wxCommandEvent& event)
 {
+    // 只能把默认收款地址改成钱包已掌握私钥的地址，并持久化对应公钥。
     CYourAddressDialog dialog(this, string(m_textCtrlAddress->GetValue()));
     if (!dialog.ShowModal())
         return;
@@ -965,7 +1010,7 @@ void CMainFrame::OnListItemActivatedOrdersReceived(wxListEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CTxDetailsDialog
+// 交易详情：从钱包交易生成可读 HTML（调试模式还会显示输入与原始交易）
 //
 
 CTxDetailsDialog::CTxDetailsDialog(wxWindow* parent, CWalletTx wtx) : CTxDetailsDialogBase(parent)
@@ -1195,7 +1240,7 @@ void CTxDetailsDialog::OnButtonOK(wxCommandEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// COptionsDialog
+// 选项：编辑默认交易费
 //
 
 COptionsDialog::COptionsDialog(wxWindow* parent) : COptionsDialogBase(parent)
@@ -1233,7 +1278,7 @@ void COptionsDialog::OnButtonCancel(wxCommandEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CAboutDialog
+// 关于窗口：版本号及旧 wxWidgets UTF-8 兼容处理
 //
 
 CAboutDialog::CAboutDialog(wxWindow* parent) : CAboutDialogBase(parent)
@@ -1242,8 +1287,8 @@ CAboutDialog::CAboutDialog(wxWindow* parent) : CAboutDialogBase(parent)
 
     // Workaround until upgrade to wxWidgets supporting UTF-8
     wxString str = m_staticTextMain->GetLabel();
-    if (str.Find('�') != wxNOT_FOUND)
-        str.Remove(str.Find('�'), 1);
+    if (str.Find('Â') != wxNOT_FOUND)
+        str.Remove(str.Find('Â'), 1);
     m_staticTextMain->SetLabel(str);
 }
 
@@ -1259,7 +1304,7 @@ void CAboutDialog::OnButtonOK(wxCommandEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CSendDialog
+// 发送窗口：校验金额，并区分标准 Bitcoin 地址付款与旧式 IP 在线付款
 //
 
 CSendDialog::CSendDialog(wxWindow* parent, const wxString& strAddress) : CSendDialogBase(parent)
@@ -1288,7 +1333,7 @@ CSendDialog::CSendDialog(wxWindow* parent, const wxString& strAddress) : CSendDi
 
 void CSendDialog::OnTextAddress(wxCommandEvent& event)
 {
-    // Check mark
+    // 标准地址可直接构造 P2PKH 脚本，不需要 IP 协商，因此禁用 from/message。
     bool fBitcoinAddress = IsValidBitcoinAddress(m_textCtrlAddress->GetValue());
     m_bitmapCheckMark->Show(fBitcoinAddress);
 
@@ -1336,6 +1381,7 @@ void CSendDialog::OnButtonPaste(wxCommandEvent& event)
 
 void CSendDialog::OnButtonSend(wxCommandEvent& event)
 {
+    // 先做所有共同的金额检查，再由地址能否解析为 Hash160 决定支付路线。
     CWalletTx wtx;
     string strAddress = (string)m_textCtrlAddress->GetValue();
 
@@ -1363,7 +1409,7 @@ void CSendDialog::OnButtonSend(wxCommandEvent& event)
 
     if (fBitcoinAddress)
     {
-        // Send to bitcoin address
+        // 标准地址路径：构造早期 P2PKH 锁定脚本，由钱包直接选币、签名和广播。
         CScript scriptPubKey;
         scriptPubKey << OP_DUP << OP_HASH160 << hash160 << OP_EQUALVERIFY << OP_CHECKSIG;
 
@@ -1374,7 +1420,7 @@ void CSendDialog::OnButtonSend(wxCommandEvent& event)
     }
     else
     {
-        // Parse IP address
+        // 非 Bitcoin 地址按 IP 解释；该历史功能会先向收款方索取付款脚本。
         CAddress addr(strAddress.c_str());
         if (addr.ip == 0)
         {
@@ -1382,12 +1428,12 @@ void CSendDialog::OnButtonSend(wxCommandEvent& event)
             return;
         }
 
-        // Message
+        // 在线支付的收付款标识和附言放在交易扩展元数据中。
         wtx.mapValue["to"] = strAddress;
         wtx.mapValue["from"] = m_textCtrlFrom->GetValue();
         wtx.mapValue["message"] = m_textCtrlMessage->GetValue();
 
-        // Send to IP address
+        // IP 路径交给 CSendingDialog 的后台握手流程，成功后才关闭本窗口。
         CSendingDialog* pdialog = new CSendingDialog(this, addr, nValue, wtx);
         if (!pdialog->ShowModal())
             return;
@@ -1412,11 +1458,13 @@ void CSendDialog::OnButtonCancel(wxCommandEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CSendingDialog
+// IP 在线支付：可取消的 UI 外壳，以及 checkorder/submitorder 网络握手
 //
 
 CSendingDialog::CSendingDialog(wxWindow* parent, const CAddress& addrIn, int64 nPriceIn, const CWalletTx& wtxIn) : CSendingDialogBase(NULL) // we have to give null so parent can't destroy us
 {
+    // 使用 NULL 父窗口是有意的：用户取消模态显示后，连接线程可能仍未返回，
+    // 对话框对象必须继续存活到 UI 与工作线程双方都完成。
     addr = addrIn;
     nPrice = nPriceIn;
     wtx = wtxIn;
@@ -1441,7 +1489,7 @@ CSendingDialog::~CSendingDialog()
 
 void CSendingDialog::Close()
 {
-    // Last one out turn out the lights.
+    // “最后离开者关灯”：两侧用 fUIDone/fWorkDone 协调最终 Destroy。
     // fWorkDone signals that work side is done and UI thread should call destroy.
     // fUIDone signals that UI window has closed and work thread should call destroy.
     // This allows the window to disappear and end modality when cancelled
@@ -1521,8 +1569,7 @@ void CSendingDialog::OnPaint(wxPaintEvent& event)
 
 
 //
-// Everything from here on is not in the UI thread and must only communicate
-// with the rest of the dialog through variables and calling repaint.
+// 以下为工作线程区域：不要直接改 wx 控件，只能更新共享状态并请求 Repaint。
 //
 
 void CSendingDialog::Repaint()
@@ -1573,6 +1620,7 @@ void SendingDialogStartTransfer(void* parg)
 
 void CSendingDialog::StartTransfer()
 {
+    // 第一阶段只验证余额、连接对端并发送订单草案；此时尚未创建或花费交易。
     // Make sure we have enough money
     if (nPrice + nTransactionFee > GetBalance())
     {
@@ -1590,7 +1638,7 @@ void CSendingDialog::StartTransfer()
         return;
     }
 
-    // Send order to seller, with response going to OnReply2 via event handler
+    // checkorder 请卖方检查订单并返回实际收款脚本，回复进入 OnReply2。
     if (!Status("Requesting public key..."))
         return;
     pnode->PushRequest("checkorder", wtx, SendingDialogOnReply2, this);
@@ -1603,6 +1651,7 @@ void SendingDialogOnReply2(void* parg, CDataStream& vRecv)
 
 void CSendingDialog::OnReply2(CDataStream& vRecv)
 {
+    // 第二阶段解析卖方的接受结果和 scriptPubKey；成功后才创建真实付款交易。
     if (!Status("Received public key..."))
         return;
 
@@ -1646,7 +1695,7 @@ void CSendingDialog::OnReply2(CDataStream& vRecv)
 
     CRITICAL_BLOCK(cs_main)
     {
-        // Pay
+        // 选币、签名和提交共享钱包状态，必须在 cs_main 临界区内连续完成。
         if (!Status("Creating transaction..."))
             return;
         if (nPrice + nTransactionFee > GetBalance())
@@ -1664,7 +1713,7 @@ void CSendingDialog::OnReply2(CDataStream& vRecv)
             return;
         }
 
-        // Last chance to cancel
+        // 提交已花费输出前是最后取消点；之后禁止取消，避免 UI 声称取消但钱已付。
         Sleep(50);
         if (!Status())
             return;
@@ -1679,17 +1728,17 @@ void CSendingDialog::OnReply2(CDataStream& vRecv)
         if (!Status("Sending payment..."))
             return;
 
-        // Commit
+        // 先在本地钱包中提交花费，防止同一输入再次被选中。
         if (!CommitTransactionSpent(wtx))
         {
             Error("Error finalizing payment");
             return;
         }
 
-        // Send payment tx to seller, with response going to OnReply3 via event handler
+        // submitorder 把完整付款交易交给卖方核验；最终回复进入 OnReply3。
         pnode->PushRequest("submitorder", wtx, SendingDialogOnReply3, this);
 
-        // Accept and broadcast transaction
+        // 同时把交易加入本节点并向网络广播，不依赖卖方代为传播。
         if (!wtx.AcceptTransaction())
             printf("ERROR: CSendingDialog : wtxNew.AcceptTransaction() %s failed\n", wtx.GetHash().ToString().c_str());
         wtx.RelayWalletTransaction();
@@ -1706,6 +1755,7 @@ void SendingDialogOnReply3(void* parg, CDataStream& vRecv)
 
 void CSendingDialog::OnReply3(CDataStream& vRecv)
 {
+    // 卖方确认只影响交互结果；若回复异常，付款交易仍可能已经广播并生效。
     int nRet;
     try
     {
@@ -1737,7 +1787,7 @@ void CSendingDialog::OnReply3(CDataStream& vRecv)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CYourAddressDialog
+// 自有地址：筛出钱包有私钥的地址，支持生成新密钥、改名和复制
 //
 
 CYourAddressDialog::CYourAddressDialog(wxWindow* parent, const string& strInitSelected) : CYourAddressDialogBase(parent)
@@ -1866,11 +1916,12 @@ void CYourAddressDialog::OnClose(wxCloseEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CAddressBookDialog
+// 联系人地址簿：筛出外部地址，并在管理模式/发送选择模式间复用
 //
 
 CAddressBookDialog::CAddressBookDialog(wxWindow* parent, const wxString& strInitSelected, bool fSendingIn) : CAddressBookDialogBase(parent)
 {
+    // 同一窗口有两种语义：发送模式返回选择；普通模式用于维护联系人。
     fSending = fSendingIn;
     if (!fSending)
         m_buttonCancel->Show(false);
@@ -2032,7 +2083,7 @@ void CAddressBookDialog::OnClose(wxCloseEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CProductsDialog
+// 早期市场：搜索网络中缓存的商品广告
 //
 
 bool CompareIntStringPairBestFirst(const pair<int, string>& item1, const pair<int, string>& item2)
@@ -2135,7 +2186,7 @@ void CProductsDialog::OnListItemActivated(wxListEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CEditProductDialog
+// 商品编辑：动态订单字段、数字签名与广告广播
 //
 
 CEditProductDialog::CEditProductDialog(wxWindow* parent) : CEditProductDialogBase(parent)
@@ -2286,6 +2337,7 @@ void CEditProductDialog::OnButtonAddField(wxCommandEvent& event)
 
 void CEditProductDialog::OnButtonSend(wxCommandEvent& event)
 {
+    // 详细版保存在本地；网络广告移除详情和订单表单，仅发布可搜索摘要。
     CProduct product;
     GetProduct(product);
 
@@ -2401,7 +2453,7 @@ void CEditProductDialog::GetProduct(CProduct& product)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CViewProductDialog
+// 商品查看与下单：异步获取详情，构造动态表单，并复用 IP 支付流程
 //
 
 CViewProductDialog::CViewProductDialog(wxWindow* parent, const CProduct& productIn) : CViewProductDialogBase(parent)
@@ -2430,6 +2482,7 @@ CViewProductDialog::~CViewProductDialog()
 
 void ThreadRequestProductDetails(void* parg)
 {
+    // 后台线程只负责联网；回复被封装成 wxEVT_REPLY1 交给窗口线程解析。
     // Extract parameters
     pair<CProduct, wxEvtHandler*>* pitem = (pair<CProduct, wxEvtHandler*>*)parg;
     CProduct product = pitem->first;
@@ -2451,6 +2504,7 @@ void ThreadRequestProductDetails(void* parg)
 
 void CViewProductDialog::OnReply1(wxCommandEvent& event)
 {
+    // 不仅校验返回码，还校验摘要哈希与卖方签名，防止详情被替换。
     CDataStream ss = GetStreamFromEvent(event);
     if (ss.empty())
     {
@@ -2490,6 +2544,7 @@ bool CompareReviewsBestFirst(const CReview* p1, const CReview* p2)
 
 void CViewProductDialog::UpdateProductDisplay(bool fDetails)
 {
+    // 商品详情/评价用 HTML；订单模板则运行时创建文本框或下拉框。
     // Product and reviews
     string strHTML;
     strHTML.reserve(4000);
@@ -2651,6 +2706,7 @@ void CViewProductDialog::GetOrder(CWalletTx& wtx)
 
 void CViewProductDialog::OnButtonSubmitForm(wxCommandEvent& event)
 {
+    // 订单字段装入 CWalletTx 扩展数据，实际付款仍走 CSendingDialog 的握手。
     m_buttonSubmitForm->Enable(false);
     m_buttonCancelForm->Enable(false);
 
@@ -2709,7 +2765,7 @@ void CViewProductDialog::OnButtonCancel(wxCommandEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CViewOrderDialog
+// 订单查看：显示订单方向、付款状态和自定义表单字段
 //
 
 CViewOrderDialog::CViewOrderDialog(wxWindow* parent, CWalletTx order, bool fReceived) : CViewOrderDialogBase(parent)
@@ -2757,7 +2813,7 @@ void CViewOrderDialog::OnButtonOK(wxCommandEvent& event)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CEditReviewDialog
+// 评价编辑：签名、验证并广播评价对象
 //
 
 CEditReviewDialog::CEditReviewDialog(wxWindow* parent) : CEditReviewDialogBase(parent)
@@ -2819,10 +2875,10 @@ void CEditReviewDialog::GetReview(CReview& review)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CMyApp
+// 应用生命周期：启动、参数、数据加载、主窗口/节点创建与异常处理
 //
 
-// Define a new application
+// wxWidgets 应用对象；IMPLEMENT_APP 会生成平台入口并进入事件循环。
 class CMyApp: public wxApp
 {
   public:
@@ -2849,6 +2905,7 @@ IMPLEMENT_APP(CMyApp)
 
 bool CMyApp::OnInit()
 {
+    // 薄异常边界：把可读错误交给统一日志，再让 wx 终止启动。
     try
     {
         return OnInit2();
@@ -2863,6 +2920,7 @@ bool CMyApp::OnInit()
 
 map<string, string> ParseParameters(int argc, char* argv[])
 {
+    // 早期 Windows 风格参数解析：统一小写，并把 -option 归一化为 /option。
     map<string, string> mapArgs;
     for (int i = 0; i < argc; i++)
     {
@@ -2884,6 +2942,8 @@ map<string, string> ParseParameters(int argc, char* argv[])
 
 bool CMyApp::OnInit2()
 {
+    // 启动总流程：
+    // 单实例 -> 参数 -> 三类持久数据 -> 钱包重接纳 -> 主窗口 -> P2P 节点 -> 挖矿。
 #ifdef _MSC_VER
     // Turn off microsoft heap dump noise for now
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
@@ -2895,8 +2955,8 @@ bool CMyApp::OnInit2()
     printf("Bitcoin CMyApp::OnInit()\n");
 
     //
-    // Limit to single instance per user
-    // Required to protect the database files if we're going to keep deleting log.*
+    // 单实例既避免两个窗口，也保护 Berkeley DB 文件不被两个进程同时操作。
+    // 若旧实例存在，尝试恢复并前置旧窗口；若旧实例退出，则本进程可继续启动。
     //
     wxString strMutexName = wxString("Bitcoin.") + getenv("HOMEPATH");
     for (int i = 0; i < strMutexName.size(); i++)
@@ -2932,7 +2992,7 @@ bool CMyApp::OnInit2()
     }
 
     //
-    // Parameters
+    // 第一轮参数会影响数据目录、网络代理、日志及诊断模式，必须在加载文件前处理。
     //
     wxImage::AddHandler(new wxPNGHandler);
     map<string, string> mapArgs = ParseParameters(argc, argv);
@@ -2962,7 +3022,8 @@ bool CMyApp::OnInit2()
     }
 
     //
-    // Load data files
+    // 按依赖顺序加载：节点地址 -> 区块索引/最佳链 -> 钱包密钥和交易。
+    // 错误先汇总，统一提示后安全退出，避免进入半初始化的主界面。
     //
     string strErrors;
     int64 nStart, nEnd;
@@ -3005,11 +3066,11 @@ bool CMyApp::OnInit2()
         return false;
     }
 
-    // Add wallet transactions that aren't already in a block to mapTransactions
+    // 将钱包中尚未入块的交易重新放回节点交易池，以便启动后继续转发/确认。
     ReacceptWalletTransactions();
 
     //
-    // Parameters
+    // 第二轮参数依赖已加载的链/钱包状态，包括打印区块树与启动挖矿。
     //
     if (mapArgs.count("/printblockindex") || mapArgs.count("/printblocktree"))
     {
@@ -3027,7 +3088,7 @@ bool CMyApp::OnInit2()
     }
 
     //
-    // Create the main frame window
+    // 先创建主窗口以提供反馈，再启动 P2P 节点；挖矿线程最后启动。
     //
     {
         pframeMain = new CMainFrame(NULL);
@@ -3041,7 +3102,7 @@ bool CMyApp::OnInit2()
                 printf("Error: _beginthread(ThreadBitcoinMiner) failed\n");
 
         //
-        // Tests
+        // 以下 /send 与 /randsendtest 是历史测试入口，不属于普通用户启动路径。
         //
         if (argc >= 2 && stricmp(argv[1], "/send") == 0)
         {

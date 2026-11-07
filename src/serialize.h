@@ -1,6 +1,44 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// serialize.h — Bitcoin v0.1.3 通用序列化框架
+//=============================================================================
+//
+// 【本文件功能】
+//   把任意 C++ 对象编码成字节流（Serialize），或从字节流还原（Unserialize），
+//   并可在不真正写出的情况下预先计算编码长度（GetSerializeSize）。
+//   同一套模板/宏服务于：网络消息、磁盘文件、对象哈希（txid / 块哈希等）。
+//
+// 【在整个系统中的作用】
+//   1. 网络层（net / main ProcessMessage）
+//      - CNode 收发缓冲区是 CDataStream；P2P 的 version/tx/block/addr 等
+//        都通过 operator<< / >> 编解码。节点间字节布局由本文件约定。
+//   2. 共识与哈希（main / script）
+//      - 交易哈希、块头哈希、SignatureHash 等先把对象序列化到流（常配合
+//        SER_GETHASH），再对该字节做双重 SHA256。布局变了哈希就变，属共识。
+//   3. 磁盘持久化（db / blk*.dat）
+//      - CAutoFile 包装 FILE*，块数据、CTxIndex、钱包记录等以 SER_DISK
+//        写入 Berkeley DB 或 blkNNNN.dat。
+//   4. 业务类型接入方式
+//      - CTransaction、CBlock、CAddress 等在各自头文件里用 IMPLEMENT_SERIALIZE
+//        + READWRITE 声明字段列表；本文件提供底层原语与容器特化。
+//
+// 【核心设计】
+//   - 面向“像流”的对象：只要有 read(char*,int) / write(char*,int) 即可。
+//   - nType：场景标志（网络 / 磁盘 / 取哈希，以及 SKIPSIG、HEADERONLY 等修饰）。
+//   - nVersion：协议/软件版本，默认 VERSION=103（即 0.1.3）；可与对端协商
+//     取较小值，以便向前兼容字段布局。
+//   - 基础类型按本机内存布局直写（x86 上为小端）；字符串/容器前缀 CompactSize。
+//
+// 【阅读提示】
+//   自定义类型 → 搜 IMPLEMENT_SERIALIZE
+//   收发包     → CDataStream
+//   读写块文件 → CAutoFile
+//   长度前缀   → WriteCompactSize / ReadCompactSize
+//
+//=============================================================================
 
 #include <vector>
 #include <map>
@@ -19,6 +57,9 @@ class CScript;
 class CDataStream;
 class CAutoFile;
 
+// 本客户端协议/软件版本号 0.1.3（1*100+0*10+3 的整数写法为 103）。
+// 用途：version 消息、流默认 nVersion、新建 DB 时写入的 "version" 记录；
+// 与交易/区块头里的 nVersion=1 不是同一概念。
 static const int VERSION = 103;
 
 
@@ -30,19 +71,27 @@ static const int VERSION = 103;
 // Templates for serializing to anything that looks like a stream,
 // i.e. anything that supports .read(char*, int) and .write(char*, int)
 //
+// 序列化场景标志（nType）：可按位组合。
+// 业务类的 IMPLEMENT_SERIALIZE 里可根据 nType 决定是否写出某字段
+// （例如 SER_BLOCKHEADERONLY 时 CBlock 只写块头、不写交易列表）。
+//
 
 enum
 {
-    // primary actions
-    SER_NETWORK         = (1 << 0),
-    SER_DISK            = (1 << 1),
-    SER_GETHASH         = (1 << 2),
+    // 主场景
+    SER_NETWORK         = (1 << 0),  // 对等网络消息编解码
+    SER_DISK            = (1 << 1),  // 落盘（blk*.dat / Berkeley DB 记录）
+    SER_GETHASH         = (1 << 2),  // 仅为计算哈希而序列化（如 GetHash）
 
-    // modifiers
-    SER_SKIPSIG         = (1 << 16),
-    SER_BLOCKHEADERONLY = (1 << 17),
+    // 修饰标志（与主场景组合使用）
+    SER_SKIPSIG         = (1 << 16), // 跳过签名相关字段（旧逻辑/特殊哈希用）
+    SER_BLOCKHEADERONLY = (1 << 17), // 只序列化块头（给非 NODE_NETWORK 的轻客户端）
 };
 
+// 为自定义类型一次性生成三个成员：
+//   GetSerializeSize / Serialize / Unserialize
+// statements 里写一连串 READWRITE(字段)；同一份字段列表同时服务“算长/写/读”，
+// 避免三处手写不一致。CTransaction、CBlock、CInv 等均依赖此宏接入本框架。
 #define IMPLEMENT_SERIALIZE(statements)    \
     unsigned int GetSerializeSize(int nType=0, int nVersion=VERSION) const  \
     {                                           \
@@ -78,6 +127,8 @@ enum
         {statements}                            \
     }
 
+// 在 IMPLEMENT_SERIALIZE 的 statements 中使用：按当前 ser_action
+// 自动走“累加长度 / 写出 / 读入”之一。可配合 if (fRead) 等做条件字段。
 #define READWRITE(obj)      (nSerSize += ::SerReadWrite(s, (obj), nType, nVersion, ser_action))
 
 
@@ -86,7 +137,8 @@ enum
 
 
 //
-// Basic types
+// Basic types — 基础类型：按内存字节原样读写（本机小端）。
+// 系统作用：构成所有更复杂结构的字节基元；金额、高度、时间戳、nonce 等直接走这里。
 //
 #define WRITEDATA(s, obj)   s.write((char*)&(obj), sizeof(obj))
 #define READDATA(s, obj)    s.read((char*)&(obj), sizeof(obj))
@@ -143,12 +195,16 @@ template<typename Stream> inline void Unserialize(Stream& s, bool& a, int, int=0
 
 
 //
-// Compact size
+// Compact size（可变长长度前缀，后世常称 CompactSize / VarInt 风格）
 //  size <  253        -- 1 byte
 //  size <= USHRT_MAX  -- 3 bytes  (253 + 2 bytes)
 //  size <= UINT_MAX   -- 5 bytes  (254 + 4 bytes)
 //  size >  UINT_MAX   -- 9 bytes  (255 + 8 bytes)
 //
+// 系统作用：string / vector / map / set / CScript 等容器在线格式都以它开头，
+// 既压缩小长度开销，又支持大集合。网络消息体与磁盘记录的容器字段都依赖此编码。
+//
+// 仅返回编码 nSize 本身需要的字节数（不含后续载荷）。
 inline unsigned int GetSizeOfCompactSize(uint64 nSize)
 {
     if (nSize < UCHAR_MAX-2)     return sizeof(unsigned char);
@@ -157,6 +213,7 @@ inline unsigned int GetSizeOfCompactSize(uint64 nSize)
     else                         return sizeof(unsigned char) + sizeof(uint64);
 }
 
+// 把长度 nSize 按 CompactSize 规则写入流。
 template<typename Stream>
 void WriteCompactSize(Stream& os, uint64 nSize)
 {
@@ -188,6 +245,7 @@ void WriteCompactSize(Stream& os, uint64 nSize)
     return;
 }
 
+// 从流中读出一个 CompactSize，返回实际长度值。
 template<typename Stream>
 uint64 ReadCompactSize(Stream& is)
 {
@@ -222,6 +280,9 @@ uint64 ReadCompactSize(Stream& is)
 //
 // Wrapper for serializing arrays and POD
 // There's a clever template way to make arrays serialize normally, but MSVC6 doesn't support it
+//
+// CFlatData / FLATDATA：把一块连续内存（数组、POD）当作原始字节写出，不加 CompactSize。
+// 系统中用于固定二进制块、C 风格数组等需要“原样拷贝”的字段。
 //
 #define FLATDATA(obj)   REF(CFlatData((char*)&(obj), (char*)&(obj) + sizeof(obj)))
 class CFlatData
@@ -258,6 +319,7 @@ public:
 
 //
 // string stored as a fixed length field
+// CFixedFieldString<LEN>：定长字符串槽（固定 LEN 字节），与带 CompactSize 的普通 string 不同。
 //
 template<std::size_t LEN>
 class CFixedFieldString
@@ -299,15 +361,15 @@ public:
 
 
 //
-// Forward declarations
+// Forward declarations — 标准库容器与 CScript 的序列化重载
 //
 
-// string
+// string：CompactSize(长度) + 原始字符
 template<typename C> unsigned int GetSerializeSize(const basic_string<C>& str, int, int=0);
 template<typename Stream, typename C> void Serialize(Stream& os, const basic_string<C>& str, int, int=0);
 template<typename Stream, typename C> void Unserialize(Stream& is, basic_string<C>& str, int, int=0);
 
-// vector
+// vector：CompactSize + 元素；基础类型可整块 memcpy，复杂类型逐元素递归
 template<typename T, typename A> unsigned int GetSerializeSize_impl(const std::vector<T, A>& v, int nType, int nVersion, const boost::true_type&);
 template<typename T, typename A> unsigned int GetSerializeSize_impl(const std::vector<T, A>& v, int nType, int nVersion, const boost::false_type&);
 template<typename T, typename A> inline unsigned int GetSerializeSize(const std::vector<T, A>& v, int nType, int nVersion=VERSION);
@@ -318,22 +380,22 @@ template<typename Stream, typename T, typename A> void Unserialize_impl(Stream& 
 template<typename Stream, typename T, typename A> void Unserialize_impl(Stream& is, std::vector<T, A>& v, int nType, int nVersion, const boost::false_type&);
 template<typename Stream, typename T, typename A> inline void Unserialize(Stream& is, std::vector<T, A>& v, int nType, int nVersion=VERSION);
 
-// others derived from vector
+// CScript 当作 vector<unsigned char> 编解码（scriptSig / scriptPubKey）
 extern inline unsigned int GetSerializeSize(const CScript& v, int nType, int nVersion=VERSION);
 template<typename Stream> void Serialize(Stream& os, const CScript& v, int nType, int nVersion=VERSION);
 template<typename Stream> void Unserialize(Stream& is, CScript& v, int nType, int nVersion=VERSION);
 
-// pair
+// pair：先 first 后 second（map 元素也走 pair）
 template<typename K, typename T> unsigned int GetSerializeSize(const std::pair<K, T>& item, int nType, int nVersion=VERSION);
 template<typename Stream, typename K, typename T> void Serialize(Stream& os, const std::pair<K, T>& item, int nType, int nVersion=VERSION);
 template<typename Stream, typename K, typename T> void Unserialize(Stream& is, std::pair<K, T>& item, int nType, int nVersion=VERSION);
 
-// map
+// map：CompactSize(个数) + 各 pair
 template<typename K, typename T, typename Pred, typename A> unsigned int GetSerializeSize(const std::map<K, T, Pred, A>& m, int nType, int nVersion=VERSION);
 template<typename Stream, typename K, typename T, typename Pred, typename A> void Serialize(Stream& os, const std::map<K, T, Pred, A>& m, int nType, int nVersion=VERSION);
 template<typename Stream, typename K, typename T, typename Pred, typename A> void Unserialize(Stream& is, std::map<K, T, Pred, A>& m, int nType, int nVersion=VERSION);
 
-// set
+// set：CompactSize(个数) + 各 key
 template<typename K, typename Pred, typename A> unsigned int GetSerializeSize(const std::set<K, Pred, A>& m, int nType, int nVersion=VERSION);
 template<typename Stream, typename K, typename Pred, typename A> void Serialize(Stream& os, const std::set<K, Pred, A>& m, int nType, int nVersion=VERSION);
 template<typename Stream, typename K, typename Pred, typename A> void Unserialize(Stream& is, std::set<K, Pred, A>& m, int nType, int nVersion=VERSION);
@@ -347,6 +409,9 @@ template<typename Stream, typename K, typename Pred, typename A> void Unserializ
 // "int nType" is changed to "long nType" to keep from getting an ambiguous overload error.
 // The compiler will only cast int to long if none of the other templates matched.
 // Thanks to Boost serialization for this idea.
+//
+// 回落到类型成员（通常由 IMPLEMENT_SERIALIZE 生成）。
+// 系统作用：CTransaction / CBlock / CAddress 等通过统一的 ::Serialize 入口被调用。
 //
 template<typename T>
 inline unsigned int GetSerializeSize(const T& a, long nType, int nVersion=VERSION)
@@ -371,7 +436,7 @@ inline void Unserialize(Stream& is, T& a, long nType, int nVersion=VERSION)
 
 
 //
-// string
+// string — CompactSize(字符数) + 字符数据（标签、文本字段等）
 //
 template<typename C>
 unsigned int GetSerializeSize(const basic_string<C>& str, int, int)
@@ -399,7 +464,8 @@ void Unserialize(Stream& is, basic_string<C>& str, int, int)
 
 
 //
-// vector
+// vector — vin/vout、vtx、脚本字节、inv 列表等大量使用
+// true_type：T 为基础类型，整段裸写；false_type：对每个元素递归 Serialize
 //
 template<typename T, typename A>
 unsigned int GetSerializeSize_impl(const std::vector<T, A>& v, int nType, int nVersion, const boost::true_type&)
@@ -453,7 +519,7 @@ void Unserialize_impl(Stream& is, std::vector<T, A>& v, int nType, int nVersion,
     //v.resize(nSize);
     //is.read((char*)&v[0], nSize * sizeof(T));
 
-    // Limit size per read so bogus size value won't cause out of memory
+    // 分块读取，避免恶意超大 size 一次性分配导致 OOM
     v.clear();
     unsigned int nSize = ReadCompactSize(is);
     unsigned int i = 0;
@@ -498,7 +564,7 @@ inline void Unserialize(Stream& is, std::vector<T, A>& v, int nType, int nVersio
 
 
 //
-// others derived from vector
+// others derived from vector — CScript 按字节向量处理
 //
 inline unsigned int GetSerializeSize(const CScript& v, int nType, int nVersion)
 {
@@ -520,7 +586,7 @@ void Unserialize(Stream& is, CScript& v, int nType, int nVersion)
 
 
 //
-// pair
+// pair — 顺序：first，再 second
 //
 template<typename K, typename T>
 unsigned int GetSerializeSize(const std::pair<K, T>& item, int nType, int nVersion)
@@ -545,7 +611,7 @@ void Unserialize(Stream& is, std::pair<K, T>& item, int nType, int nVersion)
 
 
 //
-// map
+// map — CompactSize + 各 pair；钱包 mapValue、部分 DB/消息结构会用到
 //
 template<typename K, typename T, typename Pred, typename A>
 unsigned int GetSerializeSize(const std::map<K, T, Pred, A>& m, int nType, int nVersion)
@@ -581,7 +647,7 @@ void Unserialize(Stream& is, std::map<K, T, Pred, A>& m, int nType, int nVersion
 
 
 //
-// set
+// set — CompactSize + 各元素
 //
 template<typename K, typename Pred, typename A>
 unsigned int GetSerializeSize(const std::set<K, Pred, A>& m, int nType, int nVersion)
@@ -619,16 +685,21 @@ void Unserialize(Stream& is, std::set<K, Pred, A>& m, int nType, int nVersion)
 //
 // Support for IMPLEMENT_SERIALIZE and READWRITE macro
 //
-class CSerActionGetSerializeSize { };
-class CSerActionSerialize { };
-class CSerActionUnserialize { };
+// 三个空标签类型区分“当前宏展开在干什么”；SerReadWrite 按标签分派到
+// GetSerializeSize / Serialize / Unserialize。这样 READWRITE(x) 一份代码三种用途。
+//
+class CSerActionGetSerializeSize { }; // 只计算序列化后字节数
+class CSerActionSerialize { };         // 写入流
+class CSerActionUnserialize { };       // 从流读入
 
+// 算长度：返回 obj 编码后的大小，累加到 nSerSize
 template<typename Stream, typename T>
 inline unsigned int SerReadWrite(Stream& s, const T& obj, int nType, int nVersion, CSerActionGetSerializeSize ser_action)
 {
     return ::GetSerializeSize(obj, nType, nVersion);
 }
 
+// 写出：把 obj 写入流 s
 template<typename Stream, typename T>
 inline unsigned int SerReadWrite(Stream& s, const T& obj, int nType, int nVersion, CSerActionSerialize ser_action)
 {
@@ -636,6 +707,7 @@ inline unsigned int SerReadWrite(Stream& s, const T& obj, int nType, int nVersio
     return 0;
 }
 
+// 读入：从流 s 还原到 obj
 template<typename Stream, typename T>
 inline unsigned int SerReadWrite(Stream& s, T& obj, int nType, int nVersion, CSerActionUnserialize ser_action)
 {
@@ -643,6 +715,8 @@ inline unsigned int SerReadWrite(Stream& s, T& obj, int nType, int nVersion, CSe
     return 0;
 }
 
+// GetSerializeSize 路径里没有真实 Stream，用此占位符保存 nType/nVersion，
+// 以便 statements 中仍可访问 s.nType / s.nVersion。
 struct ser_streamplaceholder
 {
     int nType;
@@ -659,6 +733,9 @@ struct ser_streamplaceholder
 
 //
 // Allocator that clears its contents before deletion
+//
+// secure_allocator：释放内存前先 memset 清零，降低私钥等敏感数据残留在堆上的风险。
+// 系统作用：CDataStream 底层 vector、以及 key 相关字节容器使用它存放可能含密钥的数据。
 //
 template<typename T>
 struct secure_allocator : public std::allocator<T>
@@ -693,17 +770,24 @@ struct secure_allocator : public std::allocator<T>
 // >> and << read and write unformatted data using the above serialization templates.
 // Fills with data in linear time; some stringstream implementations take N^2 time.
 //
+// CDataStream：内存中的可读写字节缓冲区 + 序列化流。
+// 【系统中的核心载体】
+//   - 每个 CNode 的 vSend / vRecv：拼装与解析 P2P 消息
+//   - 计算 txid / 块哈希 / SignatureHash 时的临时缓冲（常配 SER_GETHASH）
+//   - RelayMessage 缓存原始消息字节、钱包/DB 读写时的中间流等
+// nReadPos 指向尚未消费的数据起点；<< 追加到末尾，>> / read 从 nReadPos 前进。
+//
 class CDataStream
 {
 protected:
     typedef vector<char, secure_allocator<char> > vector_type;
-    vector_type vch;
-    unsigned int nReadPos;
-    short state;
-    short exceptmask;
+    vector_type vch;           // 底层字节存储（安全分配器）
+    unsigned int nReadPos;     // 读指针：已消费数据的下一字节下标
+    short state;               // iostream 风格状态位
+    short exceptmask;          // 哪些状态位置位时抛异常
 public:
-    int nType;
-    int nVersion;
+    int nType;                 // 序列化场景（SER_NETWORK 等）
+    int nVersion;              // 流协议版本（默认可为 VERSION=103）
 
     typedef vector_type::allocator_type   allocator_type;
     typedef vector_type::size_type        size_type;
@@ -715,11 +799,13 @@ public:
     typedef vector_type::const_iterator   const_iterator;
     typedef vector_type::reverse_iterator reverse_iterator;
 
+    // 空流；指定场景与版本
     explicit CDataStream(int nTypeIn=0, int nVersionIn=VERSION)
     {
         Init(nTypeIn, nVersionIn);
     }
 
+    // 由一段已有字节构造（例如刚从 socket 剥出的 payload）
     CDataStream(const_iterator pbegin, const_iterator pend, int nTypeIn=0, int nVersionIn=VERSION) : vch(pbegin, pend)
     {
         Init(nTypeIn, nVersionIn);
@@ -747,6 +833,7 @@ public:
         Init(nTypeIn, nVersionIn);
     }
 
+    // 重置读指针与流状态
     void Init(int nTypeIn=0, int nVersionIn=VERSION)
     {
         nReadPos = 0;
@@ -756,6 +843,7 @@ public:
         exceptmask = ios::badbit | ios::failbit;
     }
 
+    // 拼接另一流中尚未读完的数据到本流末尾
     CDataStream& operator+=(const CDataStream& b)
     {
         vch.insert(vch.end(), b.begin(), b.end());
@@ -769,6 +857,7 @@ public:
         return (ret);
     }
 
+    // 未读区间转为 string（调试/少数文本用途）
     string str() const
     {
         return (string(begin(), end()));
@@ -776,7 +865,7 @@ public:
 
 
     //
-    // Vector subset
+    // Vector subset — 视图从 nReadPos 起，对外表现为“剩余未读缓冲”
     //
     const_iterator begin() const                     { return vch.begin() + nReadPos; }
     iterator begin()                                 { return vch.begin() + nReadPos; }
@@ -848,12 +937,14 @@ public:
             return vch.erase(first, last);
     }
 
+    // 丢掉已读前缀，把未读数据移到缓冲区开头（回收内存）
     inline void Compact()
     {
         vch.erase(vch.begin(), vch.begin() + nReadPos);
         nReadPos = 0;
     }
 
+    // 若尚未 Compact，可将读指针回退 n 字节（重新解析刚读过的数据）
     bool Rewind(size_type n)
     {
         // Rewind by n characters if the buffer hasn't been compacted yet
@@ -865,7 +956,7 @@ public:
 
 
     //
-    // Stream subset
+    // Stream subset — 模仿 iostream 接口，供 Serialize 模板的 read/write 调用
     //
     void setstate(short bits, const char* psz)
     {
@@ -885,11 +976,12 @@ public:
 
     void SetType(int n)          { nType = n; }
     int GetType()                { return nType; }
-    void SetVersion(int n)       { nVersion = n; }
+    void SetVersion(int n)       { nVersion = n; }   // 握手后常设为 min(本地, 对端)
     int GetVersion()             { return nVersion; }
     void ReadVersion()           { *this >> nVersion; }
     void WriteVersion()          { *this << nVersion; }
 
+    // 从读指针拷贝 nSize 字节到 pch，并前进读指针；读尽则清空缓冲
     CDataStream& read(char* pch, int nSize)
     {
         // Read from the beginning of the buffer
@@ -913,6 +1005,7 @@ public:
         return (*this);
     }
 
+    // 跳过 nSize 字节（不拷贝），用于跳过不关心的字段
     CDataStream& ignore(int nSize)
     {
         // Ignore from the beginning of the buffer
@@ -933,6 +1026,7 @@ public:
         return (*this);
     }
 
+    // 在缓冲末尾追加原始字节（Serialize 基础类型最终落到这里）
     CDataStream& write(const char* pch, int nSize)
     {
         // Write to the end of the buffer
@@ -941,6 +1035,7 @@ public:
         return (*this);
     }
 
+    // 把本流整段内容当作字节写入另一流（流 << 流 即拼接）
     template<typename Stream>
     void Serialize(Stream& s, int nType=0, int nVersion=VERSION) const
     {
@@ -949,6 +1044,7 @@ public:
             s.write((char*)&vch[0], vch.size() * sizeof(vch[0]));
     }
 
+    // 若把 obj 按本流的 nType/nVersion 序列化，需要多少字节
     template<typename T>
     unsigned int GetSerializeSize(const T& obj)
     {
@@ -956,6 +1052,7 @@ public:
         return ::GetSerializeSize(obj, nType, nVersion);
     }
 
+    // 序列化写入：ss << tx; ss << block; 网络组包、算哈希前的编码都走这里
     template<typename T>
     CDataStream& operator<<(const T& obj)
     {
@@ -964,6 +1061,7 @@ public:
         return (*this);
     }
 
+    // 反序列化读出：ss >> tx; 解析 P2P payload / 磁盘记录
     template<typename T>
     CDataStream& operator>>(T& obj)
     {
@@ -1039,6 +1137,12 @@ int main(int argc, char *argv[])
 //  - If you're returning the file pointer, return file.release().
 //  - If you need to close the file early, use file.fclose() instead of fclose(file).
 //
+// CAutoFile：带 RAII 的 FILE* 包装，同时实现 read/write，故可直接作为序列化流。
+// 【系统作用】
+//   - 读写 blkNNNN.dat 中的原始区块（AppendBlockFile / ReadFromDisk）
+//   - 默认 nType=SER_DISK，与网络路径的 CDataStream 对称：同一套 Serialize 逻辑，不同载体
+//   - 析构自动 fclose；移交所有权用 release()，避免双重关闭
+//
 class CAutoFile
 {
 protected:
@@ -1046,11 +1150,12 @@ protected:
     short state;
     short exceptmask;
 public:
-    int nType;
-    int nVersion;
+    int nType;      // 通常为 SER_DISK
+    int nVersion;   // 磁盘记录使用的序列化版本
 
     typedef FILE element_type;
 
+    // 接管已打开的 FILE*；默认按磁盘场景序列化
     CAutoFile(FILE* filenew=NULL, int nTypeIn=SER_DISK, int nVersionIn=VERSION)
     {
         file = filenew;
@@ -1065,6 +1170,7 @@ public:
         fclose();
     }
 
+    // 显式关闭；忽略 stdin/stdout/stderr
     void fclose()
     {
         if (file != NULL && file != stdin && file != stdout && file != stderr)
@@ -1072,7 +1178,7 @@ public:
         file = NULL;
     }
 
-    FILE* release()             { FILE* ret = file; file = NULL; return ret; }
+    FILE* release()             { FILE* ret = file; file = NULL; return ret; } // 交出所有权，不再自动关
     operator FILE*()            { return file; }
     FILE* operator->()          { return file; }
     FILE& operator*()           { return *file; }
@@ -1082,7 +1188,7 @@ public:
 
 
     //
-    // Stream subset
+    // Stream subset — 与 CDataStream 平行的文件版接口
     //
     void setstate(short bits, const char* psz)
     {
@@ -1104,6 +1210,7 @@ public:
     void ReadVersion()           { *this >> nVersion; }
     void WriteVersion()          { *this << nVersion; }
 
+    // 从文件读原始字节（Serialize 基础类型的底层）
     CAutoFile& read(char* pch, int nSize)
     {
         if (!file)
@@ -1113,6 +1220,7 @@ public:
         return (*this);
     }
 
+    // 向文件写原始字节
     CAutoFile& write(const char* pch, int nSize)
     {
         if (!file)
@@ -1129,6 +1237,7 @@ public:
         return ::GetSerializeSize(obj, nType, nVersion);
     }
 
+    // 把对象按磁盘格式写入文件，例如 file << block;
     template<typename T>
     CAutoFile& operator<<(const T& obj)
     {
@@ -1139,6 +1248,7 @@ public:
         return (*this);
     }
 
+    // 从文件按磁盘格式读出对象，例如 file >> block;
     template<typename T>
     CAutoFile& operator>>(T& obj)
     {

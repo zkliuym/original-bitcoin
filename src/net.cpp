@@ -1,10 +1,33 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// net.cpp — Bitcoin v0.1.3 P2P 网络运行时
+//=============================================================================
+//
+// 【本文件功能】
+//   实现 TCP/代理连接、地址簿维护、连接选择、socket 收发循环、协议消息循环，
+//   以及网络子系统的启动、停止和线程生命周期管理。
+//
+// 【在整个系统中的作用】
+//   本文件位于操作系统 socket 与 Bitcoin 协议处理之间：ThreadSocketHandler
+//   把字节搬入/搬出每个 CNode 的缓冲区，ThreadMessageHandler 调用 main.cpp
+//   的 ProcessMessages/SendMessages 解释和生成协议消息，ThreadOpenConnections
+//   从地址簿挑选出站节点。IRC 线程则为地址簿提供冷启动线索。
+//
+// 【阅读提示】
+//   1. 连接路径：ConnectSocket → ConnectNode → ThreadOpenConnections2。
+//   2. 收发路径：socket → vRecv → ProcessMessages；SendMessages → vSend → socket。
+//   3. Thread* 外层函数负责异常后重启，Thread*2 承载实际循环。
+//   4. 共享 vNodes、mapAddresses、收发缓冲时注意对应临界区与引用计数。
+//
+//=============================================================================
 
 #include "headers.h"
 #include <winsock2.h>
 
+// “2”版本是实际工作循环；外层 Thread* 负责异常隔离和重启。
 void ThreadMessageHandler2(void* parg);
 void ThreadSocketHandler2(void* parg);
 void ThreadOpenConnections2(void* parg);
@@ -15,28 +38,29 @@ void ThreadOpenConnections2(void* parg);
 
 
 //
-// Global state variables
+// Global state variables — 网络线程共享的进程级状态
 //
-bool fClient = false;
-uint64 nLocalServices = (fClient ? 0 : NODE_NETWORK);
-CAddress addrLocalHost(0, DEFAULT_PORT, nLocalServices);
-CNode nodeLocalHost(INVALID_SOCKET, CAddress("127.0.0.1", nLocalServices));
-CNode* pnodeLocalHost = &nodeLocalHost;
-bool fShutdown = false;
-array<bool, 10> vfThreadRunning;
-vector<CNode*> vNodes;
+bool fClient = false;                                      // 是否仅作为轻量客户端
+uint64 nLocalServices = (fClient ? 0 : NODE_NETWORK);     // 对外声明的能力
+CAddress addrLocalHost(0, DEFAULT_PORT, nLocalServices);  // 本机通告地址
+CNode nodeLocalHost(INVALID_SOCKET, CAddress("127.0.0.1", nLocalServices)); // 本地伪节点
+CNode* pnodeLocalHost = &nodeLocalHost;                   // 保存本地订阅状态
+bool fShutdown = false;                                   // 全局退出信号
+array<bool, 10> vfThreadRunning;                          // 各线程活动标记
+vector<CNode*> vNodes;                                    // 活动连接集合
 CCriticalSection cs_vNodes;
-map<vector<unsigned char>, CAddress> mapAddresses;
+map<vector<unsigned char>, CAddress> mapAddresses;        // 已知地址簿
 CCriticalSection cs_mapAddresses;
-map<CInv, CDataStream> mapRelay;
-deque<pair<int64, CInv> > vRelayExpiration;
+map<CInv, CDataStream> mapRelay;                          // getdata 可取的消息缓存
+deque<pair<int64, CInv> > vRelayExpiration;               // 缓存过期时间线
 CCriticalSection cs_mapRelay;
-map<CInv, int64> mapAlreadyAskedFor;
+map<CInv, int64> mapAlreadyAskedFor;                      // 库存请求退避状态
 
 
+CAddress addrProxy;                                       // 可选 SOCKS4 代理
 
-CAddress addrProxy;
-
+// 建立阻塞式 TCP 连接；公网目标配置代理时执行 SOCKS4 CONNECT 握手。
+// 成功后由 ConnectNode 再把 socket 切换为非阻塞模式。
 bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet)
 {
     hSocketRet = INVALID_SOCKET;
@@ -90,6 +114,7 @@ bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet)
 
 
 
+// 向单个 HTTP 服务发请求，从正文关键字后提取公网 IPv4。
 bool GetMyExternalIP2(const CAddress& addrConnect, const char* pszGet, const char* pszKeyword, unsigned int& ipRet)
 {
     SOCKET hSocket;
@@ -134,6 +159,7 @@ bool GetMyExternalIP2(const CAddress& addrConnect, const char* pszGet, const cha
 }
 
 
+// 依次尝试两个外部服务，并先用硬编码 IP、后用 DNS 解析结果重试。
 bool GetMyExternalIP(unsigned int& ipRet)
 {
     CAddress addrConnect;
@@ -191,6 +217,7 @@ bool GetMyExternalIP(unsigned int& ipRet)
 
 
 
+// 将可路由、非本机地址合并到地址簿；新增地址或服务位增加时写盘。
 bool AddAddress(CAddrDB& addrdb, const CAddress& addr)
 {
     if (!addr.IsRoutable())
@@ -226,6 +253,7 @@ bool AddAddress(CAddrDB& addrdb, const CAddress& addr)
 
 
 
+// 清除所有节点上匹配的异步回调，避免 UI/调用对象销毁后悬空调用。
 void AbandonRequests(void (*fn)(void*, CDataStream&), void* param1)
 {
     // If the dialog might get closed before the reply comes back,
@@ -264,6 +292,8 @@ void AbandonRequests(void (*fn)(void*, CDataStream&), void* param1)
 // subscribe to 1000 random nodes, 99.995% (1 - 0.99^1000) of messages will get through.
 //
 
+// 本地伪节点或任一连接订阅频道即返回 true。
+// 这是早期内置市场机制，不属于交易/区块共识协议。
 bool AnySubscribed(unsigned int nChannel)
 {
     if (pnodeLocalHost->IsSubscribed(nChannel))
@@ -275,6 +305,7 @@ bool AnySubscribed(unsigned int nChannel)
     return false;
 }
 
+// 越界频道视为未订阅。
 bool CNode::IsSubscribed(unsigned int nChannel)
 {
     if (nChannel >= vfSubscribe.size())
@@ -282,6 +313,7 @@ bool CNode::IsSubscribed(unsigned int nChannel)
     return vfSubscribe[nChannel];
 }
 
+// 首个本地订阅者出现时向其他节点传播 subscribe。
 void CNode::Subscribe(unsigned int nChannel, unsigned int nHops)
 {
     if (nChannel >= vfSubscribe.size())
@@ -299,6 +331,7 @@ void CNode::Subscribe(unsigned int nChannel, unsigned int nHops)
     vfSubscribe[nChannel] = true;
 }
 
+// 最后一个订阅者消失时传播取消，并释放对应频道缓存。
 void CNode::CancelSubscribe(unsigned int nChannel)
 {
     if (nChannel >= vfSubscribe.size())
@@ -332,6 +365,7 @@ void CNode::CancelSubscribe(unsigned int nChannel)
 
 
 
+// 按 IP 查找活动连接，避免同一主机的重复出站连接。
 CNode* FindNode(unsigned int ip)
 {
     CRITICAL_BLOCK(cs_vNodes)
@@ -343,6 +377,7 @@ CNode* FindNode(unsigned int ip)
     return NULL;
 }
 
+// 按完整 IP+端口查找活动连接。
 CNode* FindNode(CAddress addr)
 {
     CRITICAL_BLOCK(cs_vNodes)
@@ -354,6 +389,8 @@ CNode* FindNode(CAddress addr)
     return NULL;
 }
 
+// 复用已有连接，或建立新出站连接并注册 CNode。
+// 成功后切为非阻塞；失败时间写回地址簿供选址退避。
 CNode* ConnectNode(CAddress addrConnect, int64 nTimeout)
 {
     if (addrConnect.ip == addrLocalHost.ip)
@@ -406,6 +443,8 @@ CNode* ConnectNode(CAddress addrConnect, int64 nTimeout)
     }
 }
 
+// 关闭 socket，撤销该节点维持的发布源与频道订阅。
+// CNode 对象稍后由 socket 线程在引用归零后删除。
 void CNode::Disconnect()
 {
     printf("disconnecting node %s\n", addr.ToString().c_str());
@@ -437,6 +476,7 @@ void CNode::Disconnect()
 
 
 
+// socket 线程外层守护：标记运行状态，捕获异常并延迟重启实际循环。
 void ThreadSocketHandler(void* parg)
 {
     IMPLEMENT_RANDOMIZE_STACK(ThreadSocketHandler(parg));
@@ -455,6 +495,9 @@ void ThreadSocketHandler(void* parg)
     }
 }
 
+// socket I/O 主循环。职责仅限：
+//   清理断开节点、select 轮询、accept 入站连接、recv 到 vRecv、从 vSend send。
+// 协议消息的解析与生成刻意留给 ThreadMessageHandler。
 void ThreadSocketHandler2(void* parg)
 {
     printf("ThreadSocketHandler started\n");
@@ -465,7 +508,7 @@ void ThreadSocketHandler2(void* parg)
     loop
     {
         //
-        // Disconnect nodes
+        // 断开节点：先移出活动列表，再放入隔离池等待跨线程引用和锁释放。
         //
         CRITICAL_BLOCK(cs_vNodes)
         {
@@ -487,7 +530,7 @@ void ThreadSocketHandler2(void* parg)
                 }
             }
 
-            // Delete disconnected nodes
+            // 删除断开节点：只有引用归零且所有节点锁均可取得时才释放对象。
             list<CNode*> vNodesDisconnectedCopy = vNodesDisconnected;
             foreach(CNode* pnode, vNodesDisconnectedCopy)
             {
@@ -516,7 +559,7 @@ void ThreadSocketHandler2(void* parg)
 
 
         //
-        // Find which sockets have data to receive
+        // 构造 select 集合：所有 socket 监听可读，仅发送缓冲非空者监听可写。
         //
         struct timeval timeout;
         timeout.tv_sec  = 0;
@@ -568,7 +611,7 @@ void ThreadSocketHandler2(void* parg)
 
 
         //
-        // Accept new connections
+        // 接受入站连接；新 CNode 构造时会立即排入 version 握手消息。
         //
         if (FD_ISSET(hListenSocket, &fdsetRecv))
         {
@@ -593,7 +636,7 @@ void ThreadSocketHandler2(void* parg)
 
 
         //
-        // Service each socket
+        // 逐连接服务 socket；TRY_CRITICAL_BLOCK 避免 I/O 线程阻塞在业务锁上。
         //
         vector<CNode*> vNodesCopy;
         CRITICAL_BLOCK(cs_vNodes)
@@ -604,7 +647,7 @@ void ThreadSocketHandler2(void* parg)
             SOCKET hSocket = pnode->hSocket;
 
             //
-            // Receive
+            // 接收：一次预留 64 KiB，实际收到多少保留多少；这里只积累原始字节。
             //
             if (FD_ISSET(hSocket, &fdsetRecv))
             {
@@ -640,7 +683,7 @@ void ThreadSocketHandler2(void* parg)
             }
 
             //
-            // Send
+            // 发送：允许部分写入，只从 vSend 前端删除已成功发送的字节。
             //
             if (FD_ISSET(hSocket, &fdsetSend))
             {
@@ -684,6 +727,7 @@ void ThreadSocketHandler2(void* parg)
 
 
 
+// 出站连接线程外层守护：异常后等待并重新进入选址循环。
 void ThreadOpenConnections(void* parg)
 {
     IMPLEMENT_RANDOMIZE_STACK(ThreadOpenConnections(parg));
@@ -702,6 +746,8 @@ void ThreadOpenConnections(void* parg)
     }
 }
 
+// 自动出站连接主循环：从地址簿抗洪泛地选址，维持最多 15 个连接，
+// 握手后通告本机地址、请求更多地址并同步本地订阅。
 void ThreadOpenConnections2(void* parg)
 {
     printf("ThreadOpenConnections started\n");
@@ -722,7 +768,7 @@ void ThreadOpenConnections2(void* parg)
         CheckForShutdown(1);
 
 
-        // Make a list of unique class C's
+        // 汇总唯一 /24（历史代码称 class C），先选网段、再选其中 IP。
         unsigned char pchIPCMask[4] = { 0xff, 0xff, 0xff, 0x00 };
         unsigned int nIPCMask = *(unsigned int*)pchIPCMask;
         vector<unsigned int> vIPC;
@@ -752,6 +798,8 @@ void ThreadOpenConnections2(void* parg)
         // attention within their class C, but not the whole IP address space overall.
         // A lone node in a class C will get as much attention as someone holding all 255
         // IPs in another class C.
+        // 中文提示：按网段等概率而非按地址等概率，限制攻击者在单一网段灌入
+        // 大量地址后垄断全部连接尝试；同一 IP 的不同端口会依次尝试。
         //
         bool fSuccess = false;
         int nLimit = vIPC.size();
@@ -831,6 +879,7 @@ void ThreadOpenConnections2(void* parg)
 
 
 
+// 协议消息线程外层守护：负责异常隔离与重启。
 void ThreadMessageHandler(void* parg)
 {
     IMPLEMENT_RANDOMIZE_STACK(ThreadMessageHandler(parg));
@@ -849,6 +898,8 @@ void ThreadMessageHandler(void* parg)
     }
 }
 
+// 协议消息主循环：对每个节点解析 vRecv，并把待发协议内容组装进 vSend。
+// AddRef/Release 保证处理期间节点不会被 socket 清理线程删除。
 void ThreadMessageHandler2(void* parg)
 {
     printf("ThreadMessageHandler started\n");
@@ -891,6 +942,7 @@ void ThreadMessageHandler2(void* parg)
 
 
 //// todo: start one thread per processor, use getenv("NUMBER_OF_PROCESSORS")
+// 挖矿线程适配器：维护线程状态并捕获 BitcoinMiner 抛出的异常。
 void ThreadBitcoinMiner(void* parg)
 {
     vfThreadRunning[3] = true;
@@ -914,11 +966,14 @@ void ThreadBitcoinMiner(void* parg)
 
 
 
+// 启动网络子系统：
+//   初始化 Winsock → 确定本地/外部地址 → 创建非阻塞监听 socket →
+//   启动 IRC 发现、socket I/O、出站连接和消息处理线程。
 bool StartNode(string& strError)
 {
     strError = "";
 
-    // Sockets startup
+    // 初始化进程级 Winsock 2.2。
     WSADATA wsadata;
     int ret = WSAStartup(MAKEWORD(2,2), &wsadata);
     if (ret != NO_ERROR)
@@ -928,7 +983,7 @@ bool StartNode(string& strError)
         return false;
     }
 
-    // Get local host ip
+    // 先取得局域网/主机地址，稍后可能由公网探测结果覆盖。
     char pszHostName[255];
     if (gethostname(pszHostName, 255) == SOCKET_ERROR)
     {
@@ -948,7 +1003,7 @@ bool StartNode(string& strError)
                              nLocalServices);
     printf("addrLocalHost = %s\n", addrLocalHost.ToString().c_str());
 
-    // Create socket for listening for incoming connections
+    // 创建入站 TCP 监听 socket。
     SOCKET hListenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (hListenSocket == INVALID_SOCKET)
     {
@@ -957,7 +1012,7 @@ bool StartNode(string& strError)
         return false;
     }
 
-    // Set to nonblocking, incoming connections will also inherit this
+    // 设为非阻塞；accept 得到的入站 socket 也继承该模式。
     u_long nOne = 1;
     if (ioctlsocket(hListenSocket, FIONBIO, &nOne) == SOCKET_ERROR)
     {
@@ -990,7 +1045,7 @@ bool StartNode(string& strError)
         return false;
     }
 
-    // Get our external IP address for incoming connections
+    // 优先使用钱包设置中的入站地址，再尝试外部 HTTP 服务探测公网 IP。
     if (addrIncoming.ip)
         addrLocalHost.ip = addrIncoming.ip;
 
@@ -1000,12 +1055,12 @@ bool StartNode(string& strError)
         CWalletDB().WriteSetting("addrIncoming", addrIncoming);
     }
 
-    // Get addresses from IRC and advertise ours
+    // 启动 IRC 冷启动发现：收集地址并在可路由时发布本机地址昵称。
     if (_beginthread(ThreadIRCSeed, 0, NULL) == -1)
         printf("Error: _beginthread(ThreadIRCSeed) failed\n");
 
     //
-    // Start threads
+    // 启动三条核心网络流水线：socket I/O、出站连接、协议消息处理。
     //
     if (_beginthread(ThreadSocketHandler, 0, new SOCKET(hListenSocket)) == -1)
     {
@@ -1031,6 +1086,8 @@ bool StartNode(string& strError)
     return true;
 }
 
+// 发出全局停止信号，等待核心线程退出，最后释放 Winsock。
+// nTransactionsUpdated 用于唤醒可能等待状态变化的上层逻辑。
 bool StopNode()
 {
     printf("StopNode()\n");
@@ -1056,6 +1113,7 @@ bool StopNode()
     return true;
 }
 
+// 各线程循环中的协作式取消点：清除运行标志并结束当前 CRT 线程。
 void CheckForShutdown(int n)
 {
     if (fShutdown)

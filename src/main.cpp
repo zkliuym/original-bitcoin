@@ -1,6 +1,39 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// main.cpp — Bitcoin v0.1.3 核心交易、区块链、P2P 与钱包流程
+//=============================================================================
+//
+// 【本文件功能】
+//   把“收到一笔交易/区块”直到“验证、持久化、转发”的主流程串在一起，并实现
+//   本地钱包记账、最长链切换、网络消息分派、区块组装与工作量证明搜索。
+//
+// 【在整个系统中的作用】
+//   1. 共识入口：检查交易输入、签名、费用、coinbase 成熟度、区块 PoW 与 Merkle 根。
+//   2. 链状态机：维护内存区块索引和最佳链；必要时断开旧分支并接入累计工作更优分支。
+//   3. 节点协议：解析 version/addr/inv/getdata/getblocks/tx/block 等 P2P 命令并产生响应。
+//   4. 钱包桥梁：识别属于本机的收支、保存钱包交易、选择币、签名、广播和更新余额。
+//   5. 挖矿循环：从内存池选交易、构造 coinbase/候选块、搜索 nonce，再走统一收块路径。
+//
+// 【主要段落地图（函数名比行号更可靠，增补注释后行号会变化）】
+//   - 全局链/内存池/钱包状态：文件开头
+//   - 密钥与钱包：AddKey、AddToWallet、AddToWalletIfMine
+//   - 交易与内存池：AcceptTransaction、ConnectInputs、DisconnectInputs
+//   - 区块与链切换：CheckBlock、AcceptBlock、ProcessBlock、Reorganize、AddToBlockIndex
+//   - 区块文件与创世块：OpenBlockFile、AppendBlockFile、LoadBlockIndex
+//   - P2P 收发：ProcessMessages、ProcessMessage、SendMessages
+//   - 挖矿：FormatHashBlocks、BlockSHA256、BitcoinMiner
+//   - 发币动作：GetBalance、SelectCoins、CreateTransaction、SendMoney
+//
+// 【阅读主线】
+//   网络 tx -> ProcessMessage -> AcceptTransaction -> ConnectInputs -> 内存池/转发
+//   网络 block -> ProcessBlock -> CheckBlock -> AcceptBlock -> AddToBlockIndex
+//              -> ConnectBlock（或 Reorganize）-> 最佳链/钱包更新
+//
+// 注意：这是早期 Bitcoin 实现；大量状态是进程级全局变量，锁和数据库事务共同保证一致性。
+//=============================================================================
 
 #include "headers.h"
 #include "sha.h"
@@ -9,17 +42,24 @@
 
 
 
+//////////////////////////////////////////////////////////////////////////////
 //
-// Global state
+// 全局状态
+// 这些对象连接交易内存池、区块索引、孤立对象和钱包；修改时必须遵守相应临界区。
 //
 
+// 核心共识/链状态总锁；网络消息处理、挖矿提交和发币流程用它串行化关键状态迁移。
 CCriticalSection cs_main;
 
+// 未确认交易内存池：txid -> 完整交易；mapNextTx 是 outpoint -> 花费者的反向索引，
+// 用于快速发现双花/替换冲突。nTransactionsUpdated 让矿工知道候选交易集合已变化。
 map<uint256, CTransaction> mapTransactions;
 CCriticalSection cs_mapTransactions;
 unsigned int nTransactionsUpdated = 0;
 map<COutPoint, CInPoint> mapNextTx;
 
+// 全部已知块的内存索引，以及当前主链的创世节点、最佳高度、最佳块哈希和链尖。
+// mapBlockIndex 不保存完整块体；块体位于 blk*.dat，索引记录磁盘位置和前后链接。
 map<uint256, CBlockIndex*> mapBlockIndex;
 const uint256 hashGenesisBlock("0x000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
 CBlockIndex* pindexGenesisBlock = NULL;
@@ -27,16 +67,20 @@ int nBestHeight = -1;
 uint256 hashBestChain = 0;
 CBlockIndex* pindexBest = NULL;
 
+// 前块未知的孤立块：主表按自身哈希检索，辅助 multimap 按父哈希唤醒其子块。
 map<uint256, CBlock*> mapOrphanBlocks;
 multimap<uint256, CBlock*> mapOrphanBlocksByPrev;
 
+// 输入交易未知的孤立交易；保存原始消息可在依赖到齐后原样验证和转发。
 map<uint256, CDataStream*> mapOrphanTransactions;
 multimap<uint256, CDataStream*> mapOrphanTransactionsByPrev;
 
+// 本地钱包交易及 UI 更新队列；mapWallet 同时保存收入、找零和主动发出的历史交易。
 map<uint256, CWalletTx> mapWallet;
 vector<pair<uint256, bool> > vWalletUpdated;
 CCriticalSection cs_mapWallet;
 
+// 公钥到私钥、Hash160 到公钥的本地密钥索引；keyUser 是早期客户端的用户密钥。
 map<vector<unsigned char>, CPrivKey> mapKeys;
 map<uint160, vector<unsigned char> > mapPubKeys;
 CCriticalSection cs_mapKeys;
@@ -45,7 +89,8 @@ CKey keyUser;
 string strSetDataDir;
 int nDropMessagesTest = 0;
 
-// Settings
+// strSetDataDir 覆盖默认数据目录；nDropMessagesTest 用于随机丢包的网络测试。
+// 运行设置：是否挖矿、用户指定手续费，以及监听连接所使用的本地地址。
 int fGenerateBitcoins;
 int64 nTransactionFee = 0;
 CAddress addrIncoming;
@@ -59,9 +104,10 @@ CAddress addrIncoming;
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// mapKeys
+// 密钥管理：内存索引与 wallet.dat 持久化
 //
 
+// 将一把密钥同时登记到两种内存索引并写入钱包数据库；任一步失败都向调用者报告。
 bool AddKey(const CKey& key)
 {
     CRITICAL_BLOCK(cs_mapKeys)
@@ -72,6 +118,7 @@ bool AddKey(const CKey& key)
     return CWalletDB().WriteKey(key.GetPubKey(), key.GetPrivKey());
 }
 
+// 生成全新椭圆曲线密钥，持久化私钥，并把公钥返回给收款或 coinbase 脚本。
 vector<unsigned char> GenerateNewKey()
 {
     CKey key;
@@ -86,9 +133,10 @@ vector<unsigned char> GenerateNewKey()
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// mapWallet
+// 钱包交易：合并确认信息、识别本机交易并通知界面
 //
 
+// 按 txid 新增或合并钱包记录；补齐区块/Merkle/花费状态后落盘并触发 UI 刷新。
 bool AddToWallet(const CWalletTx& wtxIn)
 {
     uint256 hash = wtxIn.GetHash();
@@ -104,6 +152,7 @@ bool AddToWallet(const CWalletTx& wtxIn)
         //// debug print
         printf("AddToWallet %s  %s\n", wtxIn.GetHash().ToString().substr(0,6).c_str(), fInsertedNew ? "new" : "update");
 
+        // 已存在时只合并更“新”的确认、Merkle 分支、来源和花费状态，避免覆盖已有元数据。
         if (!fInsertedNew)
         {
             // Merge
@@ -146,6 +195,7 @@ bool AddToWallet(const CWalletTx& wtxIn)
     return true;
 }
 
+// 若交易含本机可花费输出（或钱包已跟踪它），包装为钱包交易并附上区块证明。
 bool AddToWalletIfMine(const CTransaction& tx, const CBlock* pblock)
 {
     if (tx.IsMine() || mapWallet.count(tx.GetHash()))
@@ -159,6 +209,7 @@ bool AddToWalletIfMine(const CTransaction& tx, const CBlock* pblock)
     return true;
 }
 
+// 从内存和 wallet.dat 同时删除一笔钱包交易，主要用于旧版交易替换流程。
 bool EraseFromWallet(uint256 hash)
 {
     CRITICAL_BLOCK(cs_mapWallet)
@@ -179,9 +230,10 @@ bool EraseFromWallet(uint256 hash)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// mapOrphanTransactions
+// 孤立交易池：等待其所引用的前序交易到达
 //
 
+// 保存孤立交易的原始网络字节，并按每个 prev-txid 建立依赖反向索引。
 void AddOrphanTx(const CDataStream& vMsg)
 {
     CTransaction tx;
@@ -194,6 +246,7 @@ void AddOrphanTx(const CDataStream& vMsg)
         mapOrphanTransactionsByPrev.insert(make_pair(txin.prevout.hash, pvMsg));
 }
 
+// 删除孤立交易时同步清理全部父交易反向索引和堆上消息缓冲区。
 void EraseOrphanTx(uint256 hash)
 {
     if (!mapOrphanTransactions.count(hash))
@@ -225,9 +278,10 @@ void EraseOrphanTx(uint256 hash)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CTransaction
+// 交易、钱包交易与 Merkle 证明
 //
 
+// 判断该输入引用的钱包输出是否归本机所有。
 bool CTxIn::IsMine() const
 {
     CRITICAL_BLOCK(cs_mapWallet)
@@ -244,6 +298,7 @@ bool CTxIn::IsMine() const
     return false;
 }
 
+// 返回该输入从本钱包支出的金额；非本机输入记为 0。
 int64 CTxIn::GetDebit() const
 {
     CRITICAL_BLOCK(cs_mapWallet)
@@ -260,6 +315,7 @@ int64 CTxIn::GetDebit() const
     return 0;
 }
 
+// 优先以所在区块的中位时间代表链上时间；直接收到的交易则使用本地接收时间。
 int64 CWalletTx::GetTxTime() const
 {
     if (!fTimeReceivedIsTxTime && hashBlock != 0)
@@ -283,6 +339,7 @@ int64 CWalletTx::GetTxTime() const
 
 
 
+// 定位交易在区块中的位置并构造 Merkle 分支，最终返回其在当前主链上的确认深度。
 int CMerkleTx::SetMerkleBranch(const CBlock* pblock)
 {
     if (fClient)
@@ -336,6 +393,7 @@ int CMerkleTx::SetMerkleBranch(const CBlock* pblock)
 
 
 
+// 为浅确认交易收集最多若干层祖先，便于把一组可独立验证的交易交给其他节点。
 void CWalletTx::AddSupportingTransactions(CTxDB& txdb)
 {
     vtxPrev.clear();
@@ -403,6 +461,8 @@ void CWalletTx::AddSupportingTransactions(CTxDB& txdb)
 
 
 
+// 内存池总入口：执行交易独立检查、去重、冲突/替换判断和输入连接，成功后才入池。
+// pfMissingInputs 区分“缺父交易”与真正无效，网络层据此决定是否暂存为孤立交易。
 bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMissingInputs)
 {
     if (pfMissingInputs)
@@ -424,7 +484,7 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
         if (txdb.ContainsTx(hash))
             return false;
 
-    // Check for conflicts with in-memory transactions
+    // 检查内存池双花；早期版本允许以 IsNewerThan 规则替换同一组输入的旧版本。
     CTransaction* ptxOld = NULL;
     for (int i = 0; i < vin.size(); i++)
     {
@@ -447,7 +507,7 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
         }
     }
 
-    // Check against previous transactions
+    // 通过 ConnectInputs 读取前序输出、验签、查双花并累计费用；此处仅验证，不写链数据库。
     map<uint256, CTxIndex> mapUnused;
     int64 nFees = 0;
     if (fCheckInputs && !ConnectInputs(txdb, mapUnused, CDiskTxPos(1,1,1), 0, nFees, false, false))
@@ -457,7 +517,7 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
         return error("AcceptTransaction() : ConnectInputs failed %s", hash.ToString().substr(0,6).c_str());
     }
 
-    // Store transaction in memory
+    // 所有检查完成后原子更新交易主表和 outpoint 反向索引。
     CRITICAL_BLOCK(cs_mapTransactions)
     {
         if (ptxOld)
@@ -478,6 +538,7 @@ bool CTransaction::AcceptTransaction(CTxDB& txdb, bool fCheckInputs, bool* pfMis
 }
 
 
+// 无校验地写入内存池及输入反向索引；只能由已完成验证的路径调用。
 bool CTransaction::AddToMemoryPool()
 {
     // Add to memory pool without checking anything.  Don't call this directly,
@@ -494,6 +555,7 @@ bool CTransaction::AddToMemoryPool()
 }
 
 
+// 从内存池和输入反向索引移除交易；区块确认或链切换时用于保持池状态一致。
 bool CTransaction::RemoveFromMemoryPool()
 {
     // Remove transaction from memory pool
@@ -512,6 +574,7 @@ bool CTransaction::RemoveFromMemoryPool()
 
 
 
+// 验证已保存的 Merkle 分支确实连接到主链块头，并计算确认数。
 int CMerkleTx::GetDepthInMainChain() const
 {
     if (hashBlock == 0 || nIndex == -1)
@@ -537,6 +600,7 @@ int CMerkleTx::GetDepthInMainChain() const
 }
 
 
+// coinbase 在成熟前不可花费；额外留 20 块余量是该早期钱包的保守策略。
 int CMerkleTx::GetBlocksToMaturity() const
 {
     if (!IsCoinBase())
@@ -545,6 +609,7 @@ int CMerkleTx::GetBlocksToMaturity() const
 }
 
 
+// 根据完整节点/客户端模式选择输入验证方式，再交给普通交易内存池入口。
 bool CMerkleTx::AcceptTransaction(CTxDB& txdb, bool fCheckInputs)
 {
     if (fClient)
@@ -561,6 +626,7 @@ bool CMerkleTx::AcceptTransaction(CTxDB& txdb, bool fCheckInputs)
 
 
 
+// 先尝试接纳钱包交易携带的祖先，再接纳本交易，保证依赖顺序正确。
 bool CWalletTx::AcceptWalletTransaction(CTxDB& txdb, bool fCheckInputs)
 {
     CRITICAL_BLOCK(cs_mapTransactions)
@@ -580,6 +646,7 @@ bool CWalletTx::AcceptWalletTransaction(CTxDB& txdb, bool fCheckInputs)
     return true;
 }
 
+// 启动恢复时，把 wallet.dat 中尚未上链的本机交易重新放回内存池。
 void ReacceptWalletTransactions()
 {
     // Reaccept any txes of ours that aren't already in a block
@@ -596,6 +663,7 @@ void ReacceptWalletTransactions()
 }
 
 
+// 广播未落盘的祖先和本交易，使对端能按依赖顺序验证。
 void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
 {
     foreach(const CMerkleTx& tx, vtxPrev)
@@ -618,6 +686,7 @@ void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
     }
 }
 
+// 每十分钟按接收时间重播一次未确认钱包交易，提高掉线或漏包后的传播机会。
 void RelayWalletTransactions()
 {
     static int64 nLastTime;
@@ -656,14 +725,16 @@ void RelayWalletTransactions()
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// CBlock and CBlockIndex
+// 区块、工作量目标、磁盘交易索引与最佳链维护
 //
 
+// 根据区块索引记录的文件号/偏移读取块，可选择只读块头还是连同交易。
 bool CBlock::ReadFromDisk(const CBlockIndex* pblockindex, bool fReadTransactions)
 {
     return ReadFromDisk(pblockindex->nFile, pblockindex->nBlockPos, fReadTransactions);
 }
 
+// 沿孤立块父链回溯到最早缺口，用于向对端请求从该缺口之前开始补块。
 uint256 GetOrphanRoot(const CBlock* pblock)
 {
     // Work back to the first block in the orphan chain
@@ -672,6 +743,8 @@ uint256 GetOrphanRoot(const CBlock* pblock)
     return pblock->GetHash();
 }
 
+// 计算 coinbase 上限：初始补贴 50 BTC，每 210000 块减半，再加本块手续费。
+// 本早期实现以全局最佳高度计算下一块补贴。
 int64 CBlock::GetBlockValue(int64 nFees) const
 {
     int64 nSubsidy = 50 * COIN;
@@ -682,6 +755,7 @@ int64 CBlock::GetBlockValue(int64 nFees) const
     return nSubsidy + nFees;
 }
 
+// 计算下一块难度目标：每 2016 块按实际耗时/两周目标重定向，调整幅度限制为 1/4～4 倍。
 unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast)
 {
     const unsigned int nTargetTimespan = 14 * 24 * 60 * 60; // two weeks
@@ -696,13 +770,13 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast)
     if ((pindexLast->nHeight+1) % nInterval != 0)
         return pindexLast->nBits;
 
-    // Go back by what we want to be 14 days worth of blocks
+    // 回溯一个完整难度周期，取得周期首尾时间戳。
     const CBlockIndex* pindexFirst = pindexLast;
     for (int i = 0; pindexFirst && i < nInterval-1; i++)
         pindexFirst = pindexFirst->pprev;
     assert(pindexFirst);
 
-    // Limit adjustment step
+    // 限制异常时间戳造成的单次难度跳变。
     unsigned int nActualTimespan = pindexLast->nTime - pindexFirst->nTime;
     printf("  nActualTimespan = %d  before bounds\n", nActualTimespan);
     if (nActualTimespan < nTargetTimespan/4)
@@ -710,7 +784,7 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast)
     if (nActualTimespan > nTargetTimespan*4)
         nActualTimespan = nTargetTimespan*4;
 
-    // Retarget
+    // target 与出块耗时成正比：实际更慢则目标增大（难度降低），反之亦然。
     CBigNum bnNew;
     bnNew.SetCompact(pindexLast->nBits);
     bnNew *= nActualTimespan;
@@ -736,6 +810,8 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast)
 
 
 
+// 回滚一笔已连接交易：释放其花费的前序输出，并删除自身磁盘交易索引。
+// 区块从主链断开时按交易逆序调用，以恢复断开前的 UTXO 关系。
 bool CTransaction::DisconnectInputs(CTxDB& txdb)
 {
     // Relinquish previous transactions' spent pointers
@@ -769,6 +845,10 @@ bool CTransaction::DisconnectInputs(CTxDB& txdb)
 }
 
 
+// 连接并验证所有输入，是交易共识校验的核心：
+//   - 找到前序交易及其花费位图；检查下标、coinbase 成熟度、签名和双花；
+//   - 计算输入总额与手续费；
+//   - fBlock 时写数据库，fMiner 时只写候选块测试池，普通收交易时仅做验证。
 bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPool, CDiskTxPos posThisTx, int nHeight, int64& nFees, bool fBlock, bool fMiner, int64 nMinFee)
 {
     // Take over previous transactions' spent pointers
@@ -779,7 +859,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
         {
             COutPoint prevout = vin[i].prevout;
 
-            // Read txindex
+            // 1. 从候选块临时视图或链数据库取得前序交易的索引和已花费状态。
             CTxIndex txindex;
             bool fFound = true;
             if (fMiner && mapTestPool.count(prevout.hash))
@@ -795,7 +875,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
             if (!fFound && (fBlock || fMiner))
                 return fMiner ? false : error("ConnectInputs() : %s prev tx %s index entry not found", GetHash().ToString().substr(0,6).c_str(),  prevout.hash.ToString().substr(0,6).c_str());
 
-            // Read txPrev
+            // 2. 前序交易可能在内存池，也可能已写入块文件；按索引位置选择来源。
             CTransaction txPrev;
             if (!fFound || txindex.pos == CDiskTxPos(1,1,1))
             {
@@ -819,17 +899,17 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
             if (prevout.n >= txPrev.vout.size() || prevout.n >= txindex.vSpent.size())
                 return error("ConnectInputs() : %s prevout.n out of range %d %d %d", GetHash().ToString().substr(0,6).c_str(), prevout.n, txPrev.vout.size(), txindex.vSpent.size());
 
-            // If prev is coinbase, check that it's matured
+            // 3. coinbase 必须经过规定确认数，避免其所在链重组后凭空撤销已花资金。
             if (txPrev.IsCoinBase())
                 for (CBlockIndex* pindex = pindexBest; pindex && nBestHeight - pindex->nHeight < COINBASE_MATURITY-1; pindex = pindex->pprev)
                     if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nFile)
                         return error("ConnectInputs() : tried to spend coinbase at depth %d", nBestHeight - pindex->nHeight);
 
-            // Verify signature
+            // 4. 用被花输出的锁定脚本验证当前输入签名。
             if (!VerifySignature(txPrev, *this, i))
                 return error("ConnectInputs() : %s VerifySignature failed", GetHash().ToString().substr(0,6).c_str());
 
-            // Check for conflicts
+            // 5. 花费位非空即链上/候选块内双花；验证通过后在对应视图中标记已花。
             if (!txindex.vSpent[prevout.n].IsNull())
                 return fMiner ? false : error("ConnectInputs() : %s prev tx already used at %s", GetHash().ToString().substr(0,6).c_str(), txindex.vSpent[prevout.n].ToString().c_str());
 
@@ -845,7 +925,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
             nValueIn += txPrev.vout[prevout.n].nValue;
         }
 
-        // Tally transaction fees
+        // 6. 输出不得超过输入；差额为手续费，并须达到当前调用场景的最低费率。
         int64 nTxFee = nValueIn - GetValueOut();
         if (nTxFee < 0)
             return error("ConnectInputs() : %s nTxFee < 0", GetHash().ToString().substr(0,6).c_str());
@@ -854,6 +934,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
         nFees += nTxFee;
     }
 
+    // 7. 真正接块时登记本交易磁盘位置；矿工试装块时只创建临时索引。
     if (fBlock)
     {
         // Add transaction to disk index
@@ -870,6 +951,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, map<uint256, CTxIndex>& mapTestPoo
 }
 
 
+// 轻客户端模式只利用内存中的前序交易做验签和金额守恒检查，不访问完整磁盘索引。
 bool CTransaction::ClientConnectInputs()
 {
     if (IsCoinBase())
@@ -915,6 +997,8 @@ bool CTransaction::ClientConnectInputs()
 
 
 
+// 从主链断开一个区块：逆序撤销交易输入，并清除前一索引指向本块的磁盘后继链接。
+// 内存 pnext 要等数据库事务成功后再改，避免失败时内存/磁盘分叉。
 bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 {
     // Disconnect in reverse order
@@ -934,6 +1018,8 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
     return true;
 }
 
+// 把区块连接到当前链状态：顺序连接交易、累计手续费、校验 coinbase 奖励并更新索引。
+// 成功后还扫描本块中支付给本钱包的输出；调用者负责提交数据库事务和更新最佳链指针。
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 {
     //// issue here: it doesn't know the version
@@ -941,6 +1027,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 
     map<uint256, CTxIndex> mapUnused;
     int64 nFees = 0;
+    // 按块内顺序计算每笔交易在 blk 文件中的位置，并让后交易看到前交易的状态变化。
     foreach(CTransaction& tx, vtx)
     {
         CDiskTxPos posThisTx(pindex->nFile, pindex->nBlockPos, nTxPos);
@@ -950,6 +1037,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
             return false;
     }
 
+    // coinbase 可领取值不能超过“区块补贴 + 本块实际手续费”。
     if (vtx[0].GetValueOut() > GetBlockValue(nFees))
         return false;
 
@@ -971,11 +1059,14 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 
 
 
+// 将主链切换到更长的新分支：
+// 找共同祖先 -> 逆序断开旧分支 -> 正序连接新分支 -> 提交事务 ->
+// 修复内存链链接，并把旧分支普通交易复活到内存池、删除新分支已确认交易。
 bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 {
     printf("*** REORGANIZE ***\n");
 
-    // Find the fork
+    // 1. 两个链尖先对齐高度再同步回溯，找到共同祖先（分叉点）。
     CBlockIndex* pfork = pindexBest;
     CBlockIndex* plonger = pindexNew;
     while (pfork != plonger)
@@ -987,7 +1078,7 @@ bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
                 return error("Reorganize() : plonger->pprev is null");
     }
 
-    // List of what to disconnect
+    // 2. 整理需断开的旧链块（链尖向分叉点）和需连接的新链块（分叉点向新链尖）。
     vector<CBlockIndex*> vDisconnect;
     for (CBlockIndex* pindex = pindexBest; pindex != pfork; pindex = pindex->pprev)
         vDisconnect.push_back(pindex);
@@ -998,7 +1089,7 @@ bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         vConnect.push_back(pindex);
     reverse(vConnect.begin(), vConnect.end());
 
-    // Disconnect shorter branch
+    // 3. 在同一数据库事务中断开旧分支，并收集其中可能重新变成未确认的普通交易。
     vector<CTransaction> vResurrect;
     foreach(CBlockIndex* pindex, vDisconnect)
     {
@@ -1014,7 +1105,7 @@ bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
                 vResurrect.push_back(tx);
     }
 
-    // Connect longer branch
+    // 4. 正序连接新分支；若遇到无效块，放弃事务并清除该无效后缀的索引/块文件记录。
     vector<CTransaction> vDelete;
     for (int i = 0; i < vConnect.size(); i++)
     {
@@ -1044,10 +1135,10 @@ bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     if (!txdb.WriteHashBestChain(pindexNew->GetBlockHash()))
         return error("Reorganize() : WriteHashBestChain failed");
 
-    // Commit now because resurrecting could take some time
+    // 5. 最佳链哈希和 UTXO/交易索引先原子提交，再进行耗时的内存池修复。
     txdb.TxnCommit();
 
-    // Disconnect shorter branch
+    // 6. 数据库成功后才重接内存 pnext，令 IsInMainChain 等查询看到新主链。
     foreach(CBlockIndex* pindex, vDisconnect)
         if (pindex->pprev)
             pindex->pprev->pnext = NULL;
@@ -1057,7 +1148,7 @@ bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         if (pindex->pprev)
             pindex->pprev->pnext = pindex;
 
-    // Resurrect memory transactions that were in the disconnected branch
+    // 7. 旧链交易重新验收入池；新链已经确认的交易则从池中移除。
     foreach(CTransaction& tx, vResurrect)
         tx.AcceptTransaction(txdb, false);
 
@@ -1069,6 +1160,11 @@ bool Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 }
 
 
+// 将已落盘区块加入索引，并按其高度决定：
+//   - 直接延长当前最佳链：ConnectBlock；
+//   - 形成更优旁支：Reorganize；
+//   - 仅为普通旁支：只保存索引。
+// 这是“磁盘中的块”成为“链状态一部分”的总协调点。
 bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
 {
     // Check for duplicate
@@ -1076,7 +1172,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
     if (mapBlockIndex.count(hash))
         return error("AddToBlockIndex() : %s already exists", hash.ToString().substr(0,14).c_str());
 
-    // Construct new block index object
+    // 1. 构造内存索引，绑定 map 中稳定的哈希地址，并连接父索引/计算高度。
     CBlockIndex* pindexNew = new CBlockIndex(nFile, nBlockPos, *this);
     if (!pindexNew)
         return error("AddToBlockIndex() : new CBlockIndex failed");
@@ -1093,7 +1189,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
     txdb.TxnBegin();
     txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
 
-    // New best
+    // 2. 只有高度超过当前链尖才尝试更新最佳链；创世块是首次初始化的特例。
     if (pindexNew->nHeight > nBestHeight)
     {
         if (pindexGenesisBlock == NULL && hash == hashGenesisBlock)
@@ -1103,7 +1199,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
         }
         else if (hashPrevBlock == hashBestChain)
         {
-            // Adding to current best branch
+            // 2a. 父块正是当前链尖：直接连接，提交后移除块内已确认的内存池交易。
             if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash))
             {
                 txdb.TxnAbort();
@@ -1121,7 +1217,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
         }
         else
         {
-            // New best branch
+            // 2b. 更高但不直接接链尖：触发完整链重组。
             if (!Reorganize(txdb, pindexNew))
             {
                 txdb.TxnAbort();
@@ -1129,7 +1225,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
             }
         }
 
-        // New best link
+        // 3. 所有链状态更新成功后，发布新的全局链尖快照。
         hashBestChain = hash;
         pindexBest = pindexNew;
         nBestHeight = pindexBest->nHeight;
@@ -1151,6 +1247,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos)
 
 
 
+// 执行与父链上下文无关的区块预检：大小、未来时间、coinbase 布局、各交易、
+// PoW 上限与哈希目标、Merkle 根。孤立块也能先做这些检查，避免缓存明显垃圾。
 bool CBlock::CheckBlock() const
 {
     // These are checks that are independent of context
@@ -1189,6 +1287,8 @@ bool CBlock::CheckBlock() const
     return true;
 }
 
+// 对已有父块的区块做上下文检查（中位时间、下一难度），随后写 blk 文件并加入索引。
+// 若该块成为最佳链尖，再向邻居广播其 inventory。
 bool CBlock::AcceptBlock()
 {
     // Check for duplicate
@@ -1196,13 +1296,13 @@ bool CBlock::AcceptBlock()
     if (mapBlockIndex.count(hash))
         return error("AcceptBlock() : block already in mapBlockIndex");
 
-    // Get prev block index
+    // 父索引提供主链上下文；父块未知的情况应由 ProcessBlock 放入孤立池。
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashPrevBlock);
     if (mi == mapBlockIndex.end())
         return error("AcceptBlock() : prev block not found");
     CBlockIndex* pindexPrev = (*mi).second;
 
-    // Check timestamp against prev
+    // 时间必须晚于父链近期中位数，难度位必须精确等于该高度应有目标。
     if (nTime <= pindexPrev->GetMedianTimePast())
         return error("AcceptBlock() : block's timestamp is too early");
 
@@ -1210,7 +1310,7 @@ bool CBlock::AcceptBlock()
     if (nBits != GetNextWorkRequired(pindexPrev))
         return error("AcceptBlock() : incorrect proof of work");
 
-    // Write block to history file
+    // 验证通过后先追加不可变块数据，再由 AddToBlockIndex 原子更新链索引/状态。
     unsigned int nFile;
     unsigned int nBlockPos;
     if (!WriteToDisk(!fClient, nFile, nBlockPos))
@@ -1233,6 +1333,9 @@ bool CBlock::AcceptBlock()
     return true;
 }
 
+// 网络/矿工共用的收块总入口：去重和独立预检，父块缺失则缓存并请求补链；
+// 父块已知则接纳落盘，随后按依赖队列递归唤醒可连接的孤立后代。
+// 本函数接管 pblock 所有权，并在接纳或失败路径负责释放。
 bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 {
     // Check for duplicate
@@ -1242,14 +1345,14 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     if (mapOrphanBlocks.count(hash))
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,14).c_str());
 
-    // Preliminary checks
+    // 1. 先做不依赖父链的便宜检查，防止无效块进入孤立池或磁盘。
     if (!pblock->CheckBlock())
     {
         delete pblock;
         return error("ProcessBlock() : CheckBlock FAILED");
     }
 
-    // If don't already have its previous block, shunt it off to holding area until we get it
+    // 2. 父块未知：按自身哈希和父哈希双重索引暂存，并向来源节点请求缺失链段。
     if (!mapBlockIndex.count(pblock->hashPrevBlock))
     {
         printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().substr(0,14).c_str());
@@ -1262,7 +1365,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         return true;
     }
 
-    // Store to disk
+    // 3. 父块已知：做上下文校验、写盘并尝试更新最佳链。
     if (!pblock->AcceptBlock())
     {
         delete pblock;
@@ -1270,7 +1373,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     }
     delete pblock;
 
-    // Recursively process any orphan blocks that depended on this one
+    // 4. 当前块补上缺口后，广度优先接纳所有直接/间接依赖它的孤立块。
     vector<uint256> vWorkQueue;
     vWorkQueue.push_back(hash);
     for (int i = 0; i < vWorkQueue.size(); i++)
@@ -1301,6 +1404,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 
 
 template<typename Stream>
+// 在流中寻找四字节网络消息魔数；用于从噪声或错位数据中重新同步消息边界。
 bool ScanMessageStart(Stream& s)
 {
     // Scan ahead to the next pchMessageStart, which should normally be immediately
@@ -1341,6 +1445,7 @@ bool ScanMessageStart(Stream& s)
     }
 }
 
+// 返回并按需创建 Bitcoin 数据目录；命令行设置优先，否则使用 Windows 用户目录。
 string GetAppDir()
 {
     string strDir;
@@ -1376,6 +1481,7 @@ string GetAppDir()
     return strDir;
 }
 
+// 打开指定 blkNNNN.dat，并在读取模式下定位到给定偏移。
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode)
 {
     if (nFile == -1)
@@ -1394,8 +1500,10 @@ FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszM
     return file;
 }
 
+// 当前追加写入的块文件编号；接近早期平台 2GB 安全上限时递增。
 static unsigned int nCurrentBlockFile = 1;
 
+// 打开可继续追加的块文件，并返回所选文件号；满文件会关闭后滚动到下一编号。
 FILE* AppendBlockFile(unsigned int& nFileRet)
 {
     nFileRet = 0;
@@ -1417,19 +1525,17 @@ FILE* AppendBlockFile(unsigned int& nFileRet)
     }
 }
 
+// 启动时从数据库恢复区块索引；若数据库为空且允许新建，则精确构造、校验、
+// 写入 Bitcoin 创世块。创世块常量是网络身份和整个区块树的信任锚。
 bool LoadBlockIndex(bool fAllowNew)
 {
-    //
-    // Load block index
-    //
+    // 1. 恢复磁盘索引、主链指针和最佳链元数据。
     CTxDB txdb("cr");
     if (!txdb.LoadBlockIndex())
         return false;
     txdb.Close();
 
-    //
-    // Init with genesis block
-    //
+    // 2. 全新数据目录才进入创世初始化；禁止新建时直接报告失败。
     if (mapBlockIndex.empty())
     {
         if (!fAllowNew)
@@ -1452,7 +1558,7 @@ bool LoadBlockIndex(bool fAllowNew)
         //     CTxOut(nValue=50.00000000, scriptPubKey=0x5F1DF16B2B704C8A578D0B)
         //   vMerkleTree: 4a5e1e
 
-        // Genesis block
+        // 3. 构造唯一创世 coinbase：报纸标题既证明最早时间，也避免预挖历史伪造。
         char* pszTimestamp = "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks";
         CTransaction txNew;
         txNew.vin.resize(1);
@@ -1479,7 +1585,7 @@ bool LoadBlockIndex(bool fAllowNew)
 
         assert(block.GetHash() == hashGenesisBlock);
 
-        // Start new block file
+        // 4. 强断言 Merkle 根和块哈希后，按普通块路径写盘和建立索引。
         unsigned int nFile;
         unsigned int nBlockPos;
         if (!block.WriteToDisk(!fClient, nFile, nBlockPos))
@@ -1493,6 +1599,7 @@ bool LoadBlockIndex(bool fAllowNew)
 
 
 
+// 调试工具：从创世块开始以 ASCII 树打印所有分支，并标示每块交易与钱包 coinbase 状态。
 void PrintBlockTree()
 {
     // precompute tree structure
@@ -1585,10 +1692,11 @@ void PrintBlockTree()
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// Messages
+// P2P 消息：对象去重、接收拆包、命令分派与发送队列
 //
 
 
+// 判断某 inventory 是否已在内存池、链索引、孤立池或产品索引中，避免重复请求。
 bool AlreadyHave(CTxDB& txdb, const CInv& inv)
 {
     switch (inv.type)
@@ -1608,6 +1716,8 @@ bool AlreadyHave(CTxDB& txdb, const CInv& inv)
 
 
 
+// 从某连接的接收缓冲区连续拆包：寻找魔数、解析/校验头、等待完整载荷，
+// 再在 cs_main 下逐条调用 ProcessMessage。半包会保留到下次网络循环继续处理。
 bool ProcessMessages(CNode* pfrom)
 {
     CDataStream& vRecv = pfrom->vRecv;
@@ -1625,7 +1735,7 @@ bool ProcessMessages(CNode* pfrom)
 
     loop
     {
-        // Scan for message start
+        // 1. 与消息魔数重新同步；末尾不足一个头时保留，等待后续字节。
         CDataStream::iterator pstart = search(vRecv.begin(), vRecv.end(), BEGIN(pchMessageStart), END(pchMessageStart));
         if (vRecv.end() - pstart < sizeof(CMessageHeader))
         {
@@ -1640,7 +1750,7 @@ bool ProcessMessages(CNode* pfrom)
             printf("\n\nPROCESSMESSAGE SKIPPED %d BYTES\n\n", pstart - vRecv.begin());
         vRecv.erase(vRecv.begin(), pstart);
 
-        // Read header
+        // 2. 解析固定长度消息头并校验 command 和声明长度。
         CMessageHeader hdr;
         vRecv >> hdr;
         if (!hdr.IsValid())
@@ -1650,7 +1760,7 @@ bool ProcessMessages(CNode* pfrom)
         }
         string strCommand = hdr.GetCommand();
 
-        // Message size
+        // 3. 载荷未收全时把头放回缓冲区，不消费半条消息。
         unsigned int nMessageSize = hdr.nMessageSize;
         if (nMessageSize > vRecv.size())
         {
@@ -1662,11 +1772,11 @@ bool ProcessMessages(CNode* pfrom)
             break;
         }
 
-        // Copy message to its own buffer
+        // 4. 为完整载荷建立独立流，主缓冲区前移到下一条消息。
         CDataStream vMsg(vRecv.begin(), vRecv.begin() + nMessageSize, vRecv.nType, vRecv.nVersion);
         vRecv.ignore(nMessageSize);
 
-        // Process message
+        // 5. 共识相关命令在主锁下分派；异常被捕获，坏消息不会终止网络线程。
         bool fRet = false;
         try
         {
@@ -1687,6 +1797,8 @@ bool ProcessMessages(CNode* pfrom)
 
 
 
+// 单条 P2P 命令分派器。每个分支负责反序列化自己的载荷，并更新节点状态、
+// 请求队列、内存池、区块链或钱包；未知命令为协议可扩展性而安全忽略。
 bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 {
     static map<unsigned int, vector<unsigned char> > mapReuseKey;
@@ -1702,6 +1814,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
 
 
+    // version：连接握手，只允许一次；协商序列化版本/服务能力并启动首次区块同步。
     if (strCommand == "version")
     {
         // Can only do this once
@@ -1738,6 +1851,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // 所有其他命令都必须发生在 version 握手之后。
     else if (pfrom->nVersion == 0)
     {
         // Must have a version message before anything else
@@ -1745,6 +1859,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // addr：吸收对端分享的节点地址，并把新地址排队传播给尚未知晓它的邻居。
     else if (strCommand == "addr")
     {
         vector<CAddress> vAddr;
@@ -1769,6 +1884,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // inv：对端宣布对象哈希；本地缺少则调度 getdata，孤立块则继续请求其缺失祖先。
     else if (strCommand == "inv")
     {
         vector<CInv> vInv;
@@ -1792,6 +1908,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // getdata：按 inventory 请求返回完整块，或从中继缓存返回交易/其他已知对象。
     else if (strCommand == "getdata")
     {
         vector<CInv> vInv;
@@ -1829,6 +1946,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // getblocks：从双方共同主链块之后开始，按顺序向请求者发送区块 inventory。
     else if (strCommand == "getblocks")
     {
         CBlockLocator locator;
@@ -1865,6 +1983,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // tx：验证新交易并中继；若只是缺输入则入孤立池，父交易到达后递归重试后代。
     else if (strCommand == "tx")
     {
         vector<uint256> vWorkQueue;
@@ -1883,7 +2002,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             mapAlreadyAskedFor.erase(inv);
             vWorkQueue.push_back(inv.hash);
 
-            // Recursively process any orphan transactions that depended on this one
+            // 新交易可能补齐一串依赖，按工作队列逐层接纳并传播孤立后代。
             for (int i = 0; i < vWorkQueue.size(); i++)
             {
                 uint256 hashPrev = vWorkQueue[i];
@@ -1918,6 +2037,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // review：早期市场功能的评价对象；验证后保留原始字节中继，以兼容更高版本字段。
     else if (strCommand == "review")
     {
         CDataStream vMsg(vRecv);
@@ -1936,6 +2056,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // block：反序列化完整区块并交给统一 ProcessBlock；成功后清除请求跟踪。
     else if (strCommand == "block")
     {
         auto_ptr<CBlock> pblock(new CBlock);
@@ -1952,6 +2073,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // getaddr：返回最近见过的节点地址，帮助对端发现可连接节点。
     else if (strCommand == "getaddr")
     {
         pfrom->vAddrToSend.clear();
@@ -1971,6 +2093,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // checkorder：早期支付订单预检；为同一来源复用临时收款公钥并回复支付脚本。
     else if (strCommand == "checkorder")
     {
         uint256 hashReply;
@@ -1990,6 +2113,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // submitorder：接纳并广播已签名订单交易，写入钱包后回复成功/失败状态。
     else if (strCommand == "submitorder")
     {
         uint256 hashReply;
@@ -2012,6 +2136,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
     }
 
 
+    // reply：按请求哈希匹配异步回调，并把剩余载荷交给登记的处理函数。
     else if (strCommand == "reply")
     {
         uint256 hashReply;
@@ -2053,6 +2178,8 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
 
 
+// 刷新某对端的发送队列：握手完成后依次发送新地址、inventory 和到期的 getdata 请求。
+// set*Known 负责去重，mapAskFor 的时间键实现请求节流与延后重试。
 bool SendMessages(CNode* pto)
 {
     CheckForShutdown(2);
@@ -2063,9 +2190,7 @@ bool SendMessages(CNode* pto)
             return true;
 
 
-        //
-        // Message: addr
-        //
+        // 1. addr：只发送对端尚未知晓的地址。
         vector<CAddress> vAddrToSend;
         vAddrToSend.reserve(pto->vAddrToSend.size());
         foreach(const CAddress& addr, pto->vAddrToSend)
@@ -2076,9 +2201,7 @@ bool SendMessages(CNode* pto)
             pto->PushMessage("addr", vAddrToSend);
 
 
-        //
-        // Message: inventory
-        //
+        // 2. inv：公布新交易/区块等对象，并维护永久/临时已知集合。
         vector<CInv> vInventoryToSend;
         CRITICAL_BLOCK(pto->cs_inventory)
         {
@@ -2096,9 +2219,7 @@ bool SendMessages(CNode* pto)
             pto->PushMessage("inv", vInventoryToSend);
 
 
-        //
-        // Message: getdata
-        //
+        // 3. getdata：取出已到调度时间且本地仍缺少的对象请求。
         vector<CInv> vAskFor;
         int64 nNow = GetTime() * 1000000;
         CTxDB txdb("r");
@@ -2132,9 +2253,10 @@ bool SendMessages(CNode* pto)
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// BitcoinMiner
+// 挖矿：候选块组装、SHA-256 快速路径与 nonce 搜索
 //
 
+// 为 SHA-256 输入就地追加 0x80、零填充和大端位长度，返回所占 64 字节块数。
 int FormatHashBlocks(void* pbuffer, unsigned int len)
 {
     unsigned char* pdata = (unsigned char*)pbuffer;
@@ -2151,8 +2273,10 @@ int FormatHashBlocks(void* pbuffer, unsigned int len)
 }
 
 using CryptoPP::ByteReverse;
+// 运行时检测主机字节序，使 Crypto++ 的 32 位字状态获得规范的大端消息字。
 static int detectlittleendian = 1;
 
+// 对已填充的若干 64 字节块执行一次 SHA-256 压缩序列；挖矿双 SHA-256 调用两次。
 void BlockSHA256(const void* pin, unsigned int nBlocks, void* pout)
 {
     unsigned int* pinput = (unsigned int*)pin;
@@ -2180,6 +2304,8 @@ void BlockSHA256(const void* pin, unsigned int nBlocks, void* pout)
 }
 
 
+// CPU 挖矿主循环：等待网络连接，构造 coinbase 和候选交易集，预制哈希缓冲区，
+// 枚举 nonce 寻找 hash <= target；找到后保存收款密钥并走 ProcessBlock 统一验收。
 bool BitcoinMiner()
 {
     printf("BitcoinMiner started\n");
@@ -2203,9 +2329,7 @@ bool BitcoinMiner()
         unsigned int nBits = GetNextWorkRequired(pindexPrev);
 
 
-        //
-        // Create coinbase tx
-        //
+        // 1. coinbase 输入写入当前难度和递增 extraNonce，输出支付给本轮临时公钥。
         CTransaction txNew;
         txNew.vin.resize(1);
         txNew.vin[0].prevout.SetNull();
@@ -2214,9 +2338,7 @@ bool BitcoinMiner()
         txNew.vout[0].scriptPubKey << key.GetPubKey() << OP_CHECKSIG;
 
 
-        //
-        // Create new block
-        //
+        // 2. 创建候选块，coinbase 必须位于交易列表首位。
         auto_ptr<CBlock> pblock(new CBlock());
         if (!pblock.get())
             return false;
@@ -2224,7 +2346,7 @@ bool BitcoinMiner()
         // Add our coinbase tx as first transaction
         pblock->vtx.push_back(txNew);
 
-        // Collect the latest transactions into the block
+        // 3. 从内存池反复挑选输入已满足的最终交易；临时 mapTestPool 模拟块内花费顺序。
         int64 nFees = 0;
         CRITICAL_BLOCK(cs_main)
         CRITICAL_BLOCK(cs_mapTransactions)
@@ -2246,7 +2368,7 @@ bool BitcoinMiner()
                     if (tx.IsCoinBase() || !tx.IsFinal())
                         continue;
 
-                    // Transaction fee requirements, mainly only needed for flood control
+                    // 按交易大小/优先规则要求最低费用，主要用于抵抗低成本洪泛。
                     // Under 10K (about 80 inputs) is free for first 100 transactions
                     // Base rate is 0.01 per KB
                     int64 nMinFee = tx.GetMinFee(pblock->vtx.size() < 100);
@@ -2268,9 +2390,7 @@ bool BitcoinMiner()
         printf("\n\nRunning BitcoinMiner with %d transactions in block\n", pblock->vtx.size());
 
 
-        //
-        // Prebuild hash buffer
-        //
+        // 4. 固定块头其余字段并预先生成 SHA-256 填充区，内层循环只改 nonce/时间。
         struct unnamed1
         {
             struct unnamed2
@@ -2300,9 +2420,7 @@ bool BitcoinMiner()
         unsigned int nBlocks1 = FormatHashBlocks(&tmp.hash1, sizeof(tmp.hash1));
 
 
-        //
-        // Search
-        //
+        // 5. 双 SHA-256 搜索 nonce；小端整数比较等价于哈希不大于压缩目标。
         unsigned int nStart = GetTime();
         uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
         uint256 hash;
@@ -2323,6 +2441,7 @@ bool BitcoinMiner()
                     pblock->print();
 
                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+                // 6. 命中后先持久化 coinbase 私钥，再像网络收块一样完整验证和接链。
                 CRITICAL_BLOCK(cs_main)
                 {
                     // Save key
@@ -2340,7 +2459,7 @@ bool BitcoinMiner()
                 break;
             }
 
-            // Update nTime every few seconds
+            // 7. 每 2^18 次检查退出/链尖/内存池变化，并刷新候选块时间；条件变化则重建模板。
             if ((++tmp.block.nNonce & 0x3ffff) == 0)
             {
                 CheckForShutdown(3);
@@ -2379,10 +2498,11 @@ bool BitcoinMiner()
 
 //////////////////////////////////////////////////////////////////////////////
 //
-// Actions
+// 钱包动作：余额、选币、构造/提交/广播支付
 //
 
 
+// 汇总所有最终且未标记花费的钱包交易信用额，得到可用余额。
 int64 GetBalance()
 {
     int64 nStart, nEnd;
@@ -2407,11 +2527,13 @@ int64 GetBalance()
 
 
 
+// 为目标金额选择钱包币：
+// 优先精确匹配；否则比较“单个最小的大币”和随机近似子集和，取找零更小的方案。
 bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
 {
     setCoinsRet.clear();
 
-    // List of values less than target
+    // 1. 分类可用币：小于目标的候选、精确命中、以及最小的单个大额币。
     int64 nLowestLarger = _I64_MAX;
     CWalletTx* pcoinLowestLarger = NULL;
     vector<pair<int64, CWalletTx*> > vValue;
@@ -2445,6 +2567,7 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
         }
     }
 
+    // 所有小币仍不足时，只能使用单个最小大额币；没有则余额不足。
     if (nTotalLower < nTargetValue)
     {
         if (pcoinLowestLarger == NULL)
@@ -2453,7 +2576,7 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
         return true;
     }
 
-    // Solve subset sum by stochastic approximation
+    // 2. 随机两遍近似子集和，尝试在有限计算量内找到刚好或最接近目标的组合。
     sort(vValue.rbegin(), vValue.rend());
     vector<char> vfIncluded;
     vector<char> vfBest(vValue.size(), true);
@@ -2488,7 +2611,7 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
         }
     }
 
-    // If the next larger is still closer, return it
+    // 3. 比较最佳子集与单个大币的超额，选择产生更少找零的一方。
     if (pcoinLowestLarger && nLowestLarger - nTargetValue <= nBest - nTargetValue)
         setCoinsRet.insert(pcoinLowestLarger);
     else
@@ -2511,6 +2634,8 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
 
 
 
+// 构造但暂不提交付款交易：选择输入、创建收款和找零输出、逐输入签名，
+// 若序列化大小要求更高手续费则以新费用重建，最后附带浅确认祖先供网络验证。
 bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, int64& nFeeRequiredRet)
 {
     nFeeRequiredRet = 0;
@@ -2530,7 +2655,7 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                 int64 nValueOut = nValue;
                 nValue += nFee;
 
-                // Choose coins to use
+                // 1. 目标金额加手续费后选币并汇总输入价值。
                 set<CWalletTx*> setCoins;
                 if (!SelectCoins(nValue, setCoins))
                     return false;
@@ -2538,7 +2663,7 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                 foreach(CWalletTx* pcoin, setCoins)
                     nValueIn += pcoin->GetCredit();
 
-                // Fill vout[0] to the payee
+                // 2. 第一输出支付收款脚本；余款用所选币的一把本机公钥返回自己。
                 wtxNew.vout.push_back(CTxOut(nValueOut, scriptPubKey));
 
                 // Fill vout[1] back to self with any change
@@ -2560,27 +2685,27 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
                     wtxNew.vout.push_back(CTxOut(nValueIn - nValue, scriptPubKey));
                 }
 
-                // Fill vin
+                // 3. 把每个属于本机的被选输出转换为交易输入引用。
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
                         if (pcoin->vout[nOut].IsMine())
                             wtxNew.vin.push_back(CTxIn(pcoin->GetHash(), nOut));
 
-                // Sign
+                // 4. 使用对应前序输出和私钥逐输入生成解锁签名。
                 int nIn = 0;
                 foreach(CWalletTx* pcoin, setCoins)
                     for (int nOut = 0; nOut < pcoin->vout.size(); nOut++)
                         if (pcoin->vout[nOut].IsMine())
                             SignSignature(*pcoin, wtxNew, nIn++);
 
-                // Check that enough fee is included
+                // 5. 根据最终交易大小复核最低费；不足时增加费用并从头重建输出/找零。
                 if (nFee < wtxNew.GetMinFee(true))
                 {
                     nFee = nFeeRequiredRet = wtxNew.GetMinFee(true);
                     continue;
                 }
 
-                // Fill vtxPrev by copying from previous transactions vtxPrev
+                // 6. 携带必要祖先并标记时间语义，供接纳和广播流程使用。
                 wtxNew.AddSupportingTransactions(txdb);
                 wtxNew.fTimeReceivedIsTxTime = true;
 
@@ -2591,7 +2716,8 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, in
     return true;
 }
 
-// Call after CreateTransaction unless you want to abort
+// 在 CreateTransaction 成功且用户未取消后调用：把新交易写入钱包，并把所有输入币标为已花。
+// 注意该早期实现明确标注此处尚非单一数据库事务。
 bool CommitTransactionSpent(const CWalletTx& wtxNew)
 {
     CRITICAL_BLOCK(cs_main)
@@ -2622,6 +2748,8 @@ bool CommitTransactionSpent(const CWalletTx& wtxNew)
 
 
 
+// 钱包发送总入口：构造并签名 -> 提交钱包花费状态 -> 验收入内存池 -> 广播给邻居。
+// 提交钱包后若内存池接纳失败会抛异常，因为此时本地账本已经记录了花费。
 bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew)
 {
     CRITICAL_BLOCK(cs_main)
@@ -2645,7 +2773,7 @@ bool SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew)
 
         printf("SendMoney: %s\n", wtxNew.GetHash().ToString().substr(0,6).c_str());
 
-        // Broadcast
+        // 最终通过普通交易验证入口进入内存池，再广播本交易及必要祖先。
         if (!wtxNew.AcceptTransaction())
         {
             // This must not fail. The transaction has already been signed and recorded.

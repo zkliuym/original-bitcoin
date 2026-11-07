@@ -3,6 +3,24 @@
 // Crypto++: a C++ Class Library of Cryptographic Schemes
 // Version 5.5.2 (9/24/2007)
 // http://www.cryptopp.com
+//
+//=============================================================================
+// sha.h — 从 Crypto++ 提取的 SHA 压缩函数声明
+//=============================================================================
+//
+// 【本文件功能】
+//   定义基础字类型、固定位旋转、字节序反转，以及 SHA-1/SHA-224/SHA-256
+//   （可选 SHA-384/SHA-512）的初始状态和单分组压缩接口。
+//
+// 【在整个系统中的作用】
+//   这是独立的底层 SHA 原语，供需要直接处理压缩状态的代码使用；Bitcoin 主流程
+//   中常见的整段 double-SHA256 仍主要通过 OpenSSL SHA256 API（见 util.h）完成。
+//
+// 【阅读提示】
+//   Transform 只压缩一个已分组的数据块，不负责流式缓存、填充或输出编码。
+//   本文件保留上游 Crypto++ 的平台优化与命名，阅读重点是各 SHA 类的两个静态接口。
+//
+//=============================================================================
 #ifndef CRYPTOPP_SHA_H
 #define CRYPTOPP_SHA_H
 #include <stdlib.h>
@@ -23,6 +41,7 @@ typedef unsigned __int64 word64;
 typedef unsigned long long word64;
 #endif
 
+// 固定位数循环左移/右移，是 SHA 消息调度与轮函数的基本操作。
 template <class T> inline T rotlFixed(T x, unsigned int y)
 {
     assert(y < sizeof(T)*8);
@@ -54,6 +73,7 @@ template <class T> inline T rotrFixed(T x, unsigned int y)
     #define CRYPTOPP_FAST_ROTATE(x) 0
 #endif
 
+// 按整数宽度反转字节序；用于主机字序与 SHA 规定的大端字之间转换。
 inline byte ByteReverse(byte value)
 {
     return value;
@@ -117,6 +137,7 @@ inline word64 ByteReverse(word64 value)
 //
 
 // http://www.weidai.com/scan-mirror/md.html#SHA-1
+// SHA-1 的初始向量与 512 位分组压缩函数。
 class SHA1
 {
 public:
@@ -129,6 +150,7 @@ public:
 typedef SHA1 SHA;   // for backwards compatibility
 
 // implements the SHA-256 standard
+// SHA-256 核心：8 个 32 位状态字，每次 Transform 消化 16 个 32 位输入字。
 class SHA256
 {
 public:
@@ -139,6 +161,7 @@ public:
 };
 
 // implements the SHA-224 standard
+// SHA-224 与 SHA-256 共用压缩函数，仅初始向量和最终截断长度不同。
 class SHA224
 {
 public:
@@ -151,6 +174,7 @@ public:
 #ifdef WORD64_AVAILABLE
 
 // implements the SHA-512 standard
+// SHA-512 核心使用 64 位状态字和 1024 位数据分组。
 class SHA512
 {
 public:
@@ -161,6 +185,7 @@ public:
 };
 
 // implements the SHA-384 standard
+// SHA-384 与 SHA-512 共用压缩函数，但采用不同初始向量并截断输出。
 class SHA384
 {
 public:

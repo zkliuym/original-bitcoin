@@ -8,6 +8,24 @@
 
 // Steve Reid implemented SHA-1. Wei Dai implemented SHA-2.
 // Both are in the public domain.
+//
+//=============================================================================
+// sha.cpp — SHA-1/SHA-2 单分组压缩函数实现
+//=============================================================================
+//
+// 【本文件功能】
+//   实现 sha.h 声明的各算法初始状态和压缩轮函数，包括 SHA-1、SHA-224/256，
+//   以及条件编译下的 SHA-384/512 与旧平台 SSE2 优化路径。
+//
+// 【在整个系统中的作用】
+//   提供独立、无对象状态的底层哈希压缩原语。它不直接定义 Bitcoin 的交易哈希
+//   规则；对象序列化和 double-SHA256 的组合关系应从 serialize.h/util.h 阅读。
+//
+// 【阅读提示】
+//   InitState 写入标准初始向量；Transform 接收当前链值和一个已按算法字序准备好的
+//   数据块，完成全部轮次后把工作变量累加回 state。大量宏用于展开规范中的轮函数。
+//
+//=============================================================================
 
 #include <assert.h>
 #include <memory.h>
@@ -17,10 +35,12 @@ namespace CryptoPP
 {
 
 // start of Steve Reid's code
+// SHA-1 的 16 字循环消息调度：blk0 读取原始字，blk1 扩展后续消息字。
 
 #define blk0(i) (W[i] = data[i])
 #define blk1(i) (W[i&15] = rotlFixed(W[(i+13)&15]^W[(i+8)&15]^W[(i+2)&15]^W[i&15],1))
 
+// 写入 SHA-1 标准规定的五个 32 位初始链值。
 void SHA1::InitState(HashWordType *state)
 {
     state[0] = 0x67452301L;
@@ -42,6 +62,7 @@ void SHA1::InitState(HashWordType *state)
 #define R3(v,w,x,y,z,i) z+=f3(w,x,y)+blk1(i)+0x8F1BBCDC+rotlFixed(v,5);w=rotlFixed(w,30);
 #define R4(v,w,x,y,z,i) z+=f4(w,x,y)+blk1(i)+0xCA62C1D6+rotlFixed(v,5);w=rotlFixed(w,30);
 
+// 压缩一个 512 位分组：执行 80 轮，并把结果前馈累加到调用者的 state。
 void SHA1::Transform(word32 *state, const word32 *data)
 {
     word32 W[16];
@@ -84,18 +105,21 @@ void SHA1::Transform(word32 *state, const word32 *data)
 
 // *************************************************************
 
+// SHA-224 专用初始向量；后续轮函数与 SHA-256 相同。
 void SHA224::InitState(HashWordType *state)
 {
     static const word32 s[8] = {0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4};
     memcpy(state, s, sizeof(s));
 }
 
+// 写入 SHA-256 标准规定的八个 32 位初始链值。
 void SHA256::InitState(HashWordType *state)
 {
     static const word32 s[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
     memcpy(state, s, sizeof(s));
 }
 
+// SHA-256 每轮使用的 64 个固定加法常量。
 static const word32 SHA256_K[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
     0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -138,6 +162,7 @@ static const word32 SHA256_K[64] = {
 #define s0(x) (rotrFixed(x,7)^rotrFixed(x,18)^(x>>3))
 #define s1(x) (rotrFixed(x,17)^rotrFixed(x,19)^(x>>10))
 
+// 压缩一个 512 位分组；16 字环形缓冲复用空间，宏 R 完成消息扩展与状态更新。
 void SHA256::Transform(word32 *state, const word32 *data)
 {
     word32 W[16];
@@ -248,6 +273,7 @@ void SHA256_Transform(word32 *state, const word32 *data)
 
 #ifdef WORD64_AVAILABLE
 
+// SHA-384 的 64 位初始向量。
 void SHA384::InitState(HashWordType *state)
 {
     static const word64 s[8] = {
@@ -258,6 +284,7 @@ void SHA384::InitState(HashWordType *state)
     memcpy(state, s, sizeof(s));
 }
 
+// SHA-512 的 64 位初始向量。
 void SHA512::InitState(HashWordType *state)
 {
     static const word64 s[8] = {
@@ -268,6 +295,7 @@ void SHA512::InitState(HashWordType *state)
     memcpy(state, s, sizeof(s));
 }
 
+// SHA-512 的 80 个轮常量；对齐声明服务于可选 SSE2 汇编实现。
 CRYPTOPP_ALIGN_DATA(16) static const word64 SHA512_K[80] CRYPTOPP_SECTION_ALIGN16 = {
     W64LIT(0x428a2f98d728ae22), W64LIT(0x7137449123ef65cd),
     W64LIT(0xb5c0fbcfec4d3b2f), W64LIT(0xe9b5dba58189dbbc),
@@ -508,6 +536,7 @@ CRYPTOPP_NAKED static void CRYPTOPP_FASTCALL SHA512_SSE2_Transform(word64 *state
 }
 #endif  // #if CRYPTOPP_BOOL_SSE2_ASM_AVAILABLE
 
+// 压缩一个 1024 位分组；可用时走 SSE2，否则执行等价的 80 轮 C++ 路径。
 void SHA512::Transform(word64 *state, const word64 *data)
 {
 #if CRYPTOPP_BOOL_SSE2_ASM_AVAILABLE && CRYPTOPP_BOOL_X86

@@ -1,6 +1,25 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// bignum.h — OpenSSL 任意精度整数的 C++ 封装
+//=============================================================================
+//
+// 【本文件功能】
+//   用 RAII 和运算符封装 OpenSSL BIGNUM/BN_CTX，并提供整数、uint256、
+//   脚本数字字节串及“紧凑难度值”之间的转换。
+//
+// 【在整个系统中的作用】
+//   工作量证明目标值和难度编码依赖 CBigNum；Base58 编解码也借助它完成
+//   大整数的连续除 58/乘 58。CAutoBN_CTX 为这些 OpenSSL 运算管理临时上下文。
+//
+// 【阅读提示】
+//   CBigNum 是可变长度、有符号整数；uint256 是固定 256 位原始值。
+//   setvch/getvch 使用 Bitcoin 脚本数字的“小端、最高位符号位”表示，
+//   SetCompact/GetCompact 则处理区块头 nBits 使用的指数+尾数格式。
+//
+//=============================================================================
 
 #include <stdexcept>
 #include <vector>
@@ -10,6 +29,7 @@
 
 
 
+// OpenSSL 大数分配或计算失败时抛出的统一异常。
 class bignum_error : public std::runtime_error
 {
 public:
@@ -18,6 +38,7 @@ public:
 
 
 
+// BN_CTX 的 RAII 包装：构造时分配、析构时释放，并可隐式传给 OpenSSL API。
 class CAutoBN_CTX
 {
 protected:
@@ -46,6 +67,7 @@ public:
 
 
 
+// BIGNUM 的值类型封装，负责深拷贝、清理敏感内存、类型转换和常用算术。
 class CBigNum : public BIGNUM
 {
 public:
@@ -125,6 +147,7 @@ public:
             return (n > INT_MAX ? INT_MIN : -(int)n);
     }
 
+    // 经 OpenSSL MPI 格式导入有符号 64 位整数；MPI 最高位携带符号。
     void setint64(int64 n)
     {
         unsigned char pch[sizeof(n) + 6];
@@ -160,6 +183,7 @@ public:
         BN_mpi2bn(pch, p - pch, this);
     }
 
+    // 经 MPI 格式导入无符号 64 位整数，必要时补 0 防止被解释为负数。
     void setuint64(uint64 n)
     {
         unsigned char pch[sizeof(n) + 6];
@@ -187,6 +211,7 @@ public:
         BN_mpi2bn(pch, p - pch, this);
     }
 
+    // 把固定宽度 uint256 的小端内存反转成 MPI 的高位在前表示。
     void setuint256(uint256 n)
     {
         unsigned char pch[sizeof(n) + 6];
@@ -215,6 +240,7 @@ public:
         BN_mpi2bn(pch, p - pch, this);
     }
 
+    // 导出低 256 位到固定宽度值；符号位不会成为结果的一部分。
     uint256 getuint256()
     {
         unsigned int nSize = BN_bn2mpi(this, NULL);
@@ -230,6 +256,7 @@ public:
         return n;
     }
 
+    // 从脚本数字使用的小端有符号字节串导入。
     void setvch(const std::vector<unsigned char>& vch)
     {
         std::vector<unsigned char> vch2(vch.size() + 4);
@@ -242,6 +269,7 @@ public:
         BN_mpi2bn(&vch2[0], vch2.size(), this);
     }
 
+    // 导出为小端有符号字节串，也是 CBigNum 的线格式。
     std::vector<unsigned char> getvch() const
     {
         unsigned int nSize = BN_bn2mpi(this, NULL);
@@ -254,6 +282,7 @@ public:
         return vch;
     }
 
+    // 解析区块头 nBits：高字节是有效字节数，低 23/24 位是尾数与符号。
     CBigNum& SetCompact(unsigned int nCompact)
     {
         unsigned int nSize = nCompact >> 24;
@@ -266,6 +295,7 @@ public:
         return *this;
     }
 
+    // 将大数压缩为 nBits 使用的 32 位指数+尾数编码。
     unsigned int GetCompact() const
     {
         unsigned int nSize = BN_bn2mpi(this, NULL);
@@ -279,6 +309,7 @@ public:
         return nCompact;
     }
 
+    // 解析可带负号及 0x 前缀的十六进制整数。
     void SetHex(const std::string& str)
     {
         // skip 0x
@@ -309,6 +340,7 @@ public:
             *this = 0 - *this;
     }
 
+    // 序列化沿用 getvch 的脚本数字字节表示，并由通用框架写入长度。
     unsigned int GetSerializeSize(int nType=0, int nVersion=VERSION) const
     {
         return ::GetSerializeSize(getvch(), nType, nVersion);
@@ -424,6 +456,8 @@ public:
 
 
 
+// 以下非成员运算符把 OpenSSL 的 BN_* 操作包装成普通 C++ 值语义；
+// 乘、除、取模会临时创建 CAutoBN_CTX。
 inline const CBigNum operator+(const CBigNum& a, const CBigNum& b)
 {
     CBigNum r;

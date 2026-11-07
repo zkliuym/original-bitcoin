@@ -1,6 +1,25 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// irc.cpp — Bitcoin v0.1.3 基于 IRC 的节点发现实现
+//=============================================================================
+//
+// 【本文件功能】
+//   将本机 IPv4/端口编码进 IRC 昵称，连接 Freenode 的 #bitcoin 频道，
+//   从 WHO/JOIN 消息提取其他节点昵称并解码为 CAddress。
+//
+// 【在整个系统中的作用】
+//   这是早期客户端的冷启动引导机制：发现的地址写入 CAddrDB/mapAddresses，
+//   随后由 net.cpp 的 ThreadOpenConnections 选择并建立真正的 P2P TCP 连接。
+//   IRC 只交换地址线索，不传输交易、区块或钱包数据。
+//
+// 【阅读提示】
+//   先看 EncodeAddress/DecodeAddress 理解昵称格式，再看 RecvLineIRC 的
+//   PING/PONG 保活，最后看 ThreadIRCSeed 的连接、注册、WHO 与重连状态机。
+//
+//=============================================================================
 
 #include "headers.h"
 
@@ -8,12 +27,14 @@
 
 
 #pragma pack(1)
+// IRC 昵称载荷的紧凑二进制布局；字段保持 socket 网络字节序。
 struct ircaddr
 {
     int ip;
     short port;
 };
 
+// 把 IPv4+端口做 Base58Check 编码，并加前缀 'u' 形成可识别昵称。
 string EncodeAddress(const CAddress& addr)
 {
     struct ircaddr tmp;
@@ -24,6 +45,7 @@ string EncodeAddress(const CAddress& addr)
     return string("u") + EncodeBase58Check(vch);
 }
 
+// 校验并还原 'u'+Base58Check 昵称；失败时不产生可用地址。
 bool DecodeAddress(string str, CAddress& addr)
 {
     vector<unsigned char> vch;
@@ -44,6 +66,7 @@ bool DecodeAddress(string str, CAddress& addr)
 
 
 
+// 确保整段 IRC 命令被写入 socket；PONG 不打印以减少日志噪声。
 static bool Send(SOCKET hSocket, const char* pszSend)
 {
     if (strstr(pszSend, "PONG") != pszSend)
@@ -60,6 +83,8 @@ static bool Send(SOCKET hSocket, const char* pszSend)
     return true;
 }
 
+// 逐字节读取 CRLF 文本行；'\r' 结束，'\n' 忽略。
+// socket 关闭时仍返回已积累的最后一行。
 bool RecvLine(SOCKET hSocket, string& strLine)
 {
     strLine = "";
@@ -96,6 +121,7 @@ bool RecvLine(SOCKET hSocket, string& strLine)
     }
 }
 
+// IRC 专用行读取器：自动把服务端 PING 改为 PONG 后继续等待业务行。
 bool RecvLineIRC(SOCKET hSocket, string& strLine)
 {
     loop
@@ -119,6 +145,7 @@ bool RecvLineIRC(SOCKET hSocket, string& strLine)
     }
 }
 
+// 持续读取并打印 IRC 行，直到出现任一指定标记。
 bool RecvUntil(SOCKET hSocket, const char* psz1, const char* psz2=NULL, const char* psz3=NULL)
 {
     loop
@@ -136,6 +163,7 @@ bool RecvUntil(SOCKET hSocket, const char* psz1, const char* psz2=NULL, const ch
     }
 }
 
+// 可被 fShutdown 中断的重连等待，避免退出时长时间阻塞。
 bool Wait(int nSeconds)
 {
     if (fShutdown)
@@ -152,6 +180,9 @@ bool Wait(int nSeconds)
 
 
 
+// IRC seed 主线程：
+//   连接 Freenode → 注册编码昵称 → 加入 #bitcoin → WHO/JOIN 收集地址；
+//   断线后递增等待时间重试，直至全局关闭。
 void ThreadIRCSeed(void* parg)
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
@@ -161,6 +192,7 @@ void ThreadIRCSeed(void* parg)
 
     while (!fShutdown)
     {
+        // 每轮重新解析服务器，允许 DNS 返回可用的不同入口。
         struct hostent* phostent = gethostbyname("chat.freenode.net");
         CAddress addrConnect(*(u_long*)phostent->h_addr_list[0], htons(6667));
 
@@ -183,6 +215,7 @@ void ThreadIRCSeed(void* parg)
                 return;
         }
 
+        // 可路由节点用地址昵称公开自己；内网节点用随机昵称避免发布无效地址。
         string strMyName = EncodeAddress(addrLocalHost);
 
         if (!addrLocalHost.IsRoutable())
@@ -202,6 +235,7 @@ void ThreadIRCSeed(void* parg)
         }
         Sleep(500);
 
+        // JOIN 接收后续加入事件，WHO 获取当前已经在线的完整成员列表。
         Send(hSocket, "JOIN #bitcoin\r");
         Send(hSocket, "WHO #bitcoin\r");
 
@@ -220,6 +254,7 @@ void ThreadIRCSeed(void* parg)
             char pszName[10000];
             pszName[0] = '\0';
 
+            // 数字回复 352 是 WHO 条目；字段 7 为昵称。
             if (vWords[1] == "352" && vWords.size() >= 8)
             {
                 // index 7 is limited to 16 characters
@@ -228,6 +263,7 @@ void ThreadIRCSeed(void* parg)
                 printf("GOT WHO: [%s]  ", pszName);
             }
 
+            // JOIN 实时补充在线后新进入频道的节点。
             if (vWords[1] == "JOIN" && vWords[0].size() > 1)
             {
                 // :username!username@50000007.F000000B.90000002.IP JOIN :#channelname
@@ -237,6 +273,7 @@ void ThreadIRCSeed(void* parg)
                 printf("GOT JOIN: [%s]  ", pszName);
             }
 
+            // 仅解析本协议约定的 'u' 前缀昵称，忽略普通 IRC 用户。
             if (pszName[0] == 'u')
             {
                 CAddress addr;
@@ -271,6 +308,7 @@ void ThreadIRCSeed(void* parg)
 
 
 #ifdef TEST
+// 独立测试入口：仅用于手工验证 IRC seed 流程。
 int main(int argc, char *argv[])
 {
     WSADATA wsadata;
