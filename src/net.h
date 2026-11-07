@@ -1,7 +1,29 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// net.h — Bitcoin v0.1.3 P2P 网络层的数据结构与接口
+//=============================================================================
+//
+// 【本文件功能】
+//   定义节点通信所需的消息头、网络地址、库存标识、请求回调和连接对象，
+//   并提供消息组包、库存中继、发布/订阅以及网络线程入口的公共接口。
+//
+// 【在整个系统中的作用】
+//   1. CMessageHeader 规定 P2P 数据包边界与命令名。
+//   2. CAddress / CInv 表示可连接节点和待传播对象的“类型+哈希”。
+//   3. CNode 保存单条 TCP 连接的缓冲、握手状态、去重集合和请求队列。
+//   4. net.cpp 驱动 socket 与线程；main.cpp 解析和生成具体协议消息。
+//
+// 【阅读提示】
+//   建议按 CMessageHeader → CAddress → CInv → CNode → RelayMessage 阅读；
+//   PushMessage 只负责封包，实际发送由 ThreadSocketHandler 异步完成；
+//   ip 与 port 保持网络字节序，显示和数值比较时再做 ntoh* 转换。
+//
+//=============================================================================
 
+// 网络层核心类型的前置声明。
 class CMessageHeader;
 class CAddress;
 class CInv;
@@ -10,10 +32,12 @@ class CNode;
 
 
 
+// 主网默认 TCP 端口（网络字节序）与早期市场消息的无条件扩散跳数。
 static const unsigned short DEFAULT_PORT = htons(8333);
 static const unsigned int PUBLISH_HOPS = 5;
 enum
 {
+    // 节点能够提供完整区块链网络服务。
     NODE_NETWORK = (1 << 0),
 };
 
@@ -22,17 +46,18 @@ enum
 
 
 
-bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet);
-bool GetMyExternalIP(unsigned int& ipRet);
-bool AddAddress(CAddrDB& addrdb, const CAddress& addr);
-CNode* FindNode(unsigned int ip);
-CNode* ConnectNode(CAddress addrConnect, int64 nTimeout=0);
+bool ConnectSocket(const CAddress& addrConnect, SOCKET& hSocketRet); // 建立直连或 SOCKS4 代理连接
+bool GetMyExternalIP(unsigned int& ipRet);                           // 通过外部 HTTP 服务探测公网 IP
+bool AddAddress(CAddrDB& addrdb, const CAddress& addr);              // 地址簿去重并持久化
+CNode* FindNode(unsigned int ip);                                    // 按 IP 查找现有连接
+CNode* ConnectNode(CAddress addrConnect, int64 nTimeout=0);          // 复用或创建出站连接
+// 删除指定对象关联的异步请求，防止对象销毁后回调。
 void AbandonRequests(void (*fn)(void*, CDataStream&), void* param1);
-bool AnySubscribed(unsigned int nChannel);
-void ThreadBitcoinMiner(void* parg);
-bool StartNode(string& strError=REF(string()));
-bool StopNode();
-void CheckForShutdown(int n);
+bool AnySubscribed(unsigned int nChannel);                              // 全局查询频道订阅状态
+void ThreadBitcoinMiner(void* parg);                                 // 挖矿线程入口
+bool StartNode(string& strError=REF(string()));                      // 初始化网络并启动工作线程
+bool StopNode();                                                     // 通知线程退出并清理 Winsock
+void CheckForShutdown(int n);                                        // 在线程安全点响应关闭
 
 
 
@@ -43,7 +68,7 @@ void CheckForShutdown(int n);
 
 
 //
-// Message header
+// Message header — 每条线上消息固定 20 字节的包头
 //  (4) message start
 //  (12) command
 //  (4) size
@@ -51,15 +76,18 @@ void CheckForShutdown(int n);
 // The message start string is designed to be unlikely to occur in normal data.
 // The characters are rarely used upper ascii, not valid as UTF-8, and produce
 // a large 4-byte int at any alignment.
+// 主网魔数：用于从 TCP 字节流中识别消息边界。
 static const char pchMessageStart[4] = { 0xf9, 0xbe, 0xb4, 0xd9 };
 
+// CMessageHeader：P2P 帧头，不含 payload。
+// 接收端先验证魔数、命令字符和长度，再由 ProcessMessages 分派消息体。
 class CMessageHeader
 {
 public:
-    enum { COMMAND_SIZE=12 };
-    char pchMessageStart[sizeof(::pchMessageStart)];
-    char pchCommand[COMMAND_SIZE];
-    unsigned int nMessageSize;
+    enum { COMMAND_SIZE=12 };                         // 命令名固定槽长度
+    char pchMessageStart[sizeof(::pchMessageStart)]; // 网络魔数
+    char pchCommand[COMMAND_SIZE];                   // NUL 填充的 ASCII 命令
+    unsigned int nMessageSize;                       // payload 字节数
 
     CMessageHeader()
     {
@@ -83,6 +111,7 @@ public:
         READWRITE(nMessageSize);
     )
 
+    // 将定长命令槽转换为普通字符串。
     string GetCommand()
     {
         if (pchCommand[COMMAND_SIZE-1] == 0)
@@ -91,6 +120,7 @@ public:
             return string(pchCommand, pchCommand + COMMAND_SIZE);
     }
 
+    // 校验魔数、命令格式及 256 MiB 的消息长度上限。
     bool IsValid()
     {
         // Check start string
@@ -127,22 +157,26 @@ public:
 
 
 
+// IPv4-mapped IPv6 的 12 字节前缀，使地址在线格式固定预留 16 字节。
 static const unsigned char pchIPv4[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
 
+// CAddress：节点网络地址及其服务能力。
+// 网络消息传 services + 16 字节 IP + port；磁盘地址簿还保存版本和时间。
 class CAddress
 {
 public:
-    uint64 nServices;
-    unsigned char pchReserved[12];
-    unsigned int ip;
-    unsigned short port;
+    uint64 nServices;              // 对端能力位，如 NODE_NETWORK
+    unsigned char pchReserved[12]; // IPv4 映射前缀/未来 IPv6 预留
+    unsigned int ip;               // IPv4，网络字节序
+    unsigned short port;           // TCP 端口，网络字节序
 
-    // disk only
+    // 仅磁盘序列化：地址最后更新时间。
     unsigned int nTime;
 
-    // memory only
+    // 仅内存：最近连接失败时间，用于退避选址。
     unsigned int nLastFailed;
 
+    // 构造函数统一保持 IP/端口为网络字节序，并初始化地址时间。
     CAddress()
     {
         nServices = 0;
@@ -198,6 +232,7 @@ public:
         ip = inet_addr(psz);
     }
 
+    // SER_DISK 比线上格式额外写入版本和时间；nLastFailed 永不序列化。
     IMPLEMENT_SERIALIZE
     (
         if (nType & SER_DISK)
@@ -233,6 +268,7 @@ public:
         return false;
     }
 
+    // 生成 reserved+ip+port 的稳定键，供 mapAddresses 去重和排序。
     vector<unsigned char> GetKey() const
     {
         CDataStream ss;
@@ -246,6 +282,7 @@ public:
         #endif
     }
 
+    // 转换为 Winsock 可直接用于 connect/bind 的 sockaddr_in。
     struct sockaddr_in GetSockAddr() const
     {
         struct sockaddr_in sockaddr;
@@ -255,11 +292,13 @@ public:
         return sockaddr;
     }
 
+    // 当前地址是否使用标准 IPv4 映射前缀。
     bool IsIPv4() const
     {
         return (memcmp(pchReserved, pchIPv4, sizeof(pchIPv4)) == 0);
     }
 
+    // 排除私网、回环和 0/8 等不可公开路由地址。
     bool IsRoutable() const
     {
         return !(GetByte(3) == 10 || (GetByte(3) == 192 && GetByte(2) == 168) || GetByte(3) == 127 || GetByte(3) == 0);
@@ -300,6 +339,7 @@ public:
 
 enum
 {
+    // inv/getdata 对象类型；后 3 项属于 v0.1.3 的早期市场功能。
     MSG_TX = 1,
     MSG_BLOCK,
     MSG_REVIEW,
@@ -307,6 +347,7 @@ enum
     MSG_TABLE,
 };
 
+// CInv 类型编号到 P2P 命令名的映射。
 static const char* ppszTypeName[] =
 {
     "ERROR",
@@ -317,11 +358,13 @@ static const char* ppszTypeName[] =
     "table",
 };
 
+// CInv（inventory vector）：用“对象类型 + 256 位哈希”标识可中继对象。
+// inv 只通告标识；接收方若缺少对象，再用 getdata 请求完整内容。
 class CInv
 {
 public:
-    int type;
-    uint256 hash;
+    int type;     // MSG_TX、MSG_BLOCK 等
+    uint256 hash; // 对象内容哈希
 
     CInv()
     {
@@ -362,11 +405,13 @@ public:
         return (a.type < b.type || (a.type == b.type && a.hash < b.hash));
     }
 
+    // 确认类型编号能安全索引 ppszTypeName。
     bool IsKnownType() const
     {
         return (type >= 1 && type < ARRAYLEN(ppszTypeName));
     }
 
+    // 返回该库存类型对应的协议命令名。
     const char* GetCommand() const
     {
         if (!IsKnownType())
@@ -389,11 +434,13 @@ public:
 
 
 
+// CRequestTracker：旧式异步请求/回复机制的回调记录。
+// PushRequest 生成随机回复 ID，响应到达后据此调用回调。
 class CRequestTracker
 {
 public:
-    void (*fn)(void*, CDataStream&);
-    void* param1;
+    void (*fn)(void*, CDataStream&); // 回复到达时执行
+    void* param1;                    // 调用方上下文
 
     explicit CRequestTracker(void (*fnIn)(void*, CDataStream&)=NULL, void* param1In=NULL)
     {
@@ -411,65 +458,69 @@ public:
 
 
 
-extern bool fClient;
-extern uint64 nLocalServices;
-extern CAddress addrLocalHost;
-extern CNode* pnodeLocalHost;
-extern bool fShutdown;
-extern array<bool, 10> vfThreadRunning;
-extern vector<CNode*> vNodes;
+// 网络子系统共享状态；访问容器时须持有紧邻声明的临界区。
+extern bool fClient;                    // 是否为不提供完整服务的客户端
+extern uint64 nLocalServices;           // 本节点对外声明的服务位
+extern CAddress addrLocalHost;          // 本机对外通告地址
+extern CNode* pnodeLocalHost;           // 保存本机订阅状态的伪节点
+extern bool fShutdown;                  // 全局停止标志
+extern array<bool, 10> vfThreadRunning; // 工作线程运行标志
+extern vector<CNode*> vNodes;           // 当前活动连接
 extern CCriticalSection cs_vNodes;
-extern map<vector<unsigned char>, CAddress> mapAddresses;
+extern map<vector<unsigned char>, CAddress> mapAddresses; // 已知地址簿
 extern CCriticalSection cs_mapAddresses;
-extern map<CInv, CDataStream> mapRelay;
-extern deque<pair<int64, CInv> > vRelayExpiration;
+extern map<CInv, CDataStream> mapRelay;             // 可响应 getdata 的消息缓存
+extern deque<pair<int64, CInv> > vRelayExpiration;  // 中继缓存过期队列
 extern CCriticalSection cs_mapRelay;
-extern map<CInv, int64> mapAlreadyAskedFor;
-extern CAddress addrProxy;
+extern map<CInv, int64> mapAlreadyAskedFor;         // 请求重试节流时间
+extern CAddress addrProxy;                          // 可选 SOCKS4 代理
 
 
 
 
 
+// CNode：一条活动 P2P TCP 连接的完整运行时状态。
+// socket 线程只搬运字节；消息线程负责协议解析与消息生成。
 class CNode
 {
 public:
-    // socket
-    uint64 nServices;
-    SOCKET hSocket;
-    CDataStream vSend;
-    CDataStream vRecv;
+    // socket 与握手状态
+    uint64 nServices;      // version 消息中获知的对端服务位
+    SOCKET hSocket;        // 对端 TCP socket
+    CDataStream vSend;     // 等待 socket 线程发送的消息字节
+    CDataStream vRecv;     // 等待消息线程解析的接收字节
     CCriticalSection cs_vSend;
     CCriticalSection cs_vRecv;
-    unsigned int nPushPos;
-    CAddress addr;
-    int nVersion;
-    bool fClient;
-    bool fInbound;
-    bool fNetworkNode;
-    bool fDisconnect;
+    unsigned int nPushPos; // 正在组装的消息头位置；-1 表示无消息
+    CAddress addr;         // 对端地址
+    int nVersion;          // 握手协商后的协议版本
+    bool fClient;          // 对端是否不提供 NODE_NETWORK
+    bool fInbound;         // 是否为 accept 得到的入站连接
+    bool fNetworkNode;     // 是否由自动出站线程维护
+    bool fDisconnect;      // 请求 socket 线程断开
 protected:
-    int nRefCount;
+    int nRefCount;         // 跨线程生命周期引用计数
 public:
-    int64 nReleaseTime;
-    map<uint256, CRequestTracker> mapRequests;
+    int64 nReleaseTime;    // 超时引用的最晚释放时刻
+    map<uint256, CRequestTracker> mapRequests; // 回复 ID → 回调
     CCriticalSection cs_mapRequests;
 
-    // flood
+    // 地址洪泛：待发地址及对端已知地址集合。
     vector<CAddress> vAddrToSend;
     set<CAddress> setAddrKnown;
 
-    // inventory based relay
+    // 库存中继：已知集合去重，待发向量由 SendMessages 批量发出。
     set<CInv> setInventoryKnown;
     set<CInv> setInventoryKnown2;
     vector<CInv> vInventoryToSend;
     CCriticalSection cs_inventory;
-    multimap<int64, CInv> mapAskFor;
+    multimap<int64, CInv> mapAskFor; // 最早请求时刻 → 库存
 
-    // publish and subscription
+    // 早期市场功能的频道订阅位图。
     vector<char> vfSubscribe;
 
 
+    // 接管 socket、初始化协议状态，并立即排入 version 握手。
     CNode(SOCKET hSocketIn, CAddress addrIn, bool fInboundIn=false)
     {
         nServices = 0;
@@ -487,7 +538,7 @@ public:
         nReleaseTime = 0;
         vfSubscribe.assign(256, false);
 
-        // Push a version message
+        // 创建后立即排入 version 握手消息，并不在构造函数内直接 send。
         /// when NTP implemented, change to just nTime = GetAdjustedTime()
         int64 nTime = (fInbound ? GetAdjustedTime() : GetTime());
         PushMessage("version", VERSION, nLocalServices, nTime, addr);
@@ -505,16 +556,19 @@ private:
 public:
 
 
+    // 已要求断开或引用全部释放时，可进入断开流程。
     bool ReadyToDisconnect()
     {
         return fDisconnect || GetRefCount() <= 0;
     }
 
+    // 显式引用与尚未到期的超时引用共同决定有效引用数。
     int GetRefCount()
     {
         return max(nRefCount, 0) + (GetTime() < nReleaseTime ? 1 : 0);
     }
 
+    // 增加普通引用，或把超时保活期限向后延长。
     void AddRef(int64 nTimeout=0)
     {
         if (nTimeout != 0)
@@ -523,6 +577,7 @@ public:
             nRefCount++;
     }
 
+    // 释放一个普通引用；最终删除由 socket 清理线程执行。
     void Release()
     {
         nRefCount--;
@@ -530,12 +585,14 @@ public:
 
 
 
+    // 记录对端已知库存，防止重复 inv。
     void AddInventoryKnown(const CInv& inv)
     {
         CRITICAL_BLOCK(cs_inventory)
             setInventoryKnown.insert(inv);
     }
 
+    // 对端尚未知时，加入待通告队列。
     void PushInventory(const CInv& inv)
     {
         CRITICAL_BLOCK(cs_inventory)
@@ -543,6 +600,7 @@ public:
                 vInventoryToSend.push_back(inv);
     }
 
+    // 安排 getdata；同一对象每次重试至少间隔两分钟。
     void AskFor(const CInv& inv)
     {
         // We're using mapAskFor as a priority queue,
@@ -562,6 +620,7 @@ public:
 
 
 
+    // 开始原子组包：锁定 vSend，先写 payload 长度为 0 的消息头。
     void BeginMessage(const char* pszCommand)
     {
         EnterCriticalSection(&cs_vSend);
@@ -572,6 +631,7 @@ public:
         printf("sending: %-12s ", pszCommand);
     }
 
+    // 回滚未完成消息并释放发送锁。
     void AbortMessage()
     {
         if (nPushPos == -1)
@@ -582,6 +642,7 @@ public:
         printf("(aborted)\n");
     }
 
+    // 回填 payload 长度，提交消息并释放发送锁。
     void EndMessage()
     {
         extern int nDropMessagesTest;
@@ -608,6 +669,7 @@ public:
         LeaveCriticalSection(&cs_vSend);
     }
 
+    // 仅在 payload 非空时提交，常用于批量消息。
     void EndMessageAbortIfEmpty()
     {
         if (nPushPos == -1)
@@ -619,6 +681,7 @@ public:
             AbortMessage();
     }
 
+    // 调试辅助：返回当前正在组装的消息命令。
     const char* GetMessageCommand() const
     {
         if (nPushPos == -1)
@@ -629,6 +692,8 @@ public:
 
 
 
+    // PushMessage 各重载执行“写头—序列化参数—回填长度”；
+    // 异常时统一回滚，真正的 socket 发送稍后异步进行。
     void PushMessage(const char* pszCommand)
     {
         try
@@ -708,6 +773,7 @@ public:
     }
 
 
+    // 发送带随机回复 ID 的请求并登记一次性回调。
     void PushRequest(const char* pszCommand,
                      void (*fn)(void*, CDataStream&), void* param1)
     {
@@ -748,6 +814,7 @@ public:
 
 
 
+    // 早期发布/订阅频道管理。
     bool IsSubscribed(unsigned int nChannel);
     void Subscribe(unsigned int nChannel, unsigned int nHops=0);
     void CancelSubscribe(unsigned int nChannel);
@@ -763,6 +830,7 @@ public:
 
 
 
+// 向全部连接排入 inv 通告；每个 CNode 自行去重。
 inline void RelayInventory(const CInv& inv)
 {
     // Put on lists to offer to the other nodes
@@ -771,6 +839,7 @@ inline void RelayInventory(const CInv& inv)
             pnode->PushInventory(inv);
 }
 
+// 按网络格式序列化对象并交给中继缓存。
 template<typename T>
 void RelayMessage(const CInv& inv, const T& a)
 {
@@ -780,6 +849,8 @@ void RelayMessage(const CInv& inv, const T& a)
     RelayMessage(inv, ss);
 }
 
+// 保存原始字节 15 分钟，再广播库存标识。
+// 保留原始序列化可避免新版本字段被旧节点解析后丢失。
 template<>
 inline void RelayMessage<>(const CInv& inv, const CDataStream& ss)
 {
@@ -814,7 +885,9 @@ inline void RelayMessage<>(const CInv& inv, const CDataStream& ss)
 //   specializations of AdvertInsert and AdvertErase
 // Currently implemented for CTable and CProduct.
 //
+// 这是早期 Bitcoin 内置市场原型的传播层，与交易/区块共识无关。
 
+// 记录来源，首次插入后按跳数或订阅关系继续转发。
 template<typename T>
 void AdvertStartPublish(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
 {
@@ -831,6 +904,7 @@ void AdvertStartPublish(CNode* pfrom, unsigned int nChannel, unsigned int nHops,
                 pnode->PushMessage("publish", nChannel, nHops, obj);
 }
 
+// 广播取消并从本地广告表删除对象。
 template<typename T>
 void AdvertStopPublish(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
 {
@@ -844,6 +918,7 @@ void AdvertStopPublish(CNode* pfrom, unsigned int nChannel, unsigned int nHops, 
     AdvertErase(obj);
 }
 
+// 对端断开时移除来源；已无来源则停止发布。
 template<typename T>
 void AdvertRemoveSource(CNode* pfrom, unsigned int nChannel, unsigned int nHops, T& obj)
 {

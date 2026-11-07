@@ -1,6 +1,24 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// base58.h — Base58Check 与早期 Bitcoin 地址编码
+//=============================================================================
+//
+// 【本文件功能】
+//   在字节串与易抄写的 Base58 文本之间转换；Base58Check 追加/校验双 SHA256
+//   的前 4 字节；并把 160 位公钥哈希包装为主网地址。
+//
+// 【在整个系统中的作用】
+//   钱包和界面用这里的函数显示、输入、验证 Bitcoin 地址。地址不是公钥本身，
+//   而是“版本字节 + Hash160 + 校验和”的可读编码。
+//
+// 【阅读提示】
+//   原始 Base58 转换使用 CBigNum 做除 58/乘 58；输入前导 0 字节映射为字符 '1'。
+//   本 v0.1.3 代码只有 ADDRESSVERSION=0 的主网 P2PKH 风格地址。
+//
+//=============================================================================
 
 
 //
@@ -13,9 +31,11 @@
 //
 
 
+// 去掉易混淆字符 0/O/I/l 后的 58 字符字母表；索引即对应数值。
 static const char* pszBase58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 
+// 把高位在前的任意字节串编码成 Base58，并显式保留所有前导零。
 inline string EncodeBase58(const unsigned char* pbegin, const unsigned char* pend)
 {
     CAutoBN_CTX pctx;
@@ -59,6 +79,7 @@ inline string EncodeBase58(const vector<unsigned char>& vch)
     return EncodeBase58(&vch[0], &vch[0] + vch.size());
 }
 
+// 解析 Base58 文本为高位在前的字节串；拒绝非字母表字符（末尾空白除外）。
 inline bool DecodeBase58(const char* psz, vector<unsigned char>& vchRet)
 {
     CAutoBN_CTX pctx;
@@ -114,6 +135,7 @@ inline bool DecodeBase58(const string& str, vector<unsigned char>& vchRet)
 
 
 
+// 在负载末尾追加 double-SHA256 的前 4 字节，再进行 Base58 编码。
 inline string EncodeBase58Check(const vector<unsigned char>& vchIn)
 {
     // add 4-byte hash check to the end
@@ -123,6 +145,7 @@ inline string EncodeBase58Check(const vector<unsigned char>& vchIn)
     return EncodeBase58(vch);
 }
 
+// 解码并验证 4 字节校验和；失败时清空输出，避免调用者误用未验证数据。
 inline bool DecodeBase58Check(const char* psz, vector<unsigned char>& vchRet)
 {
     if (!DecodeBase58(psz, vchRet))
@@ -152,8 +175,10 @@ inline bool DecodeBase58Check(const string& str, vector<unsigned char>& vchRet)
 
 
 
+// 主网普通地址版本字节；编码后这类地址通常以字符 '1' 开头。
 static const unsigned char ADDRESSVERSION = 0;
 
+// 将 20 字节公钥哈希封装为版本 0 的 Base58Check 地址。
 inline string Hash160ToAddress(uint160 hash160)
 {
     // add 1-byte version number to the front
@@ -162,6 +187,7 @@ inline string Hash160ToAddress(uint160 hash160)
     return EncodeBase58Check(vch);
 }
 
+// 验证地址、检查长度与版本，并取回其中的 160 位公钥哈希。
 inline bool AddressToHash160(const char* psz, uint160& hash160Ret)
 {
     vector<unsigned char> vch;
@@ -181,6 +207,7 @@ inline bool AddressToHash160(const string& str, uint160& hash160Ret)
     return AddressToHash160(str.c_str(), hash160Ret);
 }
 
+// 地址格式与校验和的轻量验证入口。
 inline bool IsValidBitcoinAddress(const char* psz)
 {
     uint160 hash160;
@@ -195,6 +222,7 @@ inline bool IsValidBitcoinAddress(const string& str)
 
 
 
+// 公钥先做 RIPEMD160(SHA256(pubkey))，再编码为可显示地址。
 inline string PubKeyToAddress(const vector<unsigned char>& vchPubKey)
 {
     return Hash160ToAddress(Hash160(vchPubKey));

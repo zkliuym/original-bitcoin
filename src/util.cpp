@@ -1,19 +1,40 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// util.cpp — 通用工具的进程级实现
+//=============================================================================
+//
+// 【本文件功能】
+//   实现 util.h 中的随机源初始化、格式化与错误报告、金额解析、文件工具、
+//   无偏随机数，以及根据对等节点样本校正本地网络时间。
+//
+// 【在整个系统中的作用】
+//   本文件在进程启动时配置旧版 OpenSSL 的线程锁并播种 PRNG；运行期间为钱包、
+//   网络和界面模块提供共同的系统服务。这里的时间偏移会影响节点使用的“当前时间”。
+//
+// 【阅读提示】
+//   CInit 的全局实例在 main 之前构造、退出时析构。金额内部单位由 main.h 的
+//   CENT 等常量决定；ParseMoney/FormatMoney 处理的是早期客户端的两位小数界面。
+//
+//=============================================================================
 
 #include "headers.h"
 
 
 
+// 进程级调试开关，供各模块共享。
 bool fDebug = false;
 
 
 
 
 // Init openssl library multithreading support
+// OpenSSL 0.9.x 需要应用程序提供静态锁回调；每个锁编号对应一个 Win32 mutex。
 static HANDLE* lock_cs;
 
+// OpenSSL 在进入/离开其内部共享结构时调用的加锁回调。
 void win32_locking_callback(int mode, int type, const char* file, int line)
 {
     if (mode & CRYPTO_LOCK)
@@ -23,6 +44,7 @@ void win32_locking_callback(int mode, int type, const char* file, int line)
 }
 
 // Init
+// 进程生命周期初始化器：安装 OpenSSL 锁，收集系统熵；析构时反向释放。
 class CInit
 {
 public:
@@ -54,6 +76,7 @@ instance_of_cinit;
 
 
 
+// 始终混入高精度计数器；首次或每隔五分钟还可混入 Windows 性能注册表数据。
 void RandAddSeed(bool fPerfmon)
 {
     // Seed with CPU performance counter
@@ -104,6 +127,7 @@ void RandAddSeed(bool fPerfmon)
 //  - prints up to limit-1 characters
 //  - output string is always null terminated even if limit reached
 //  - return value is the number of characters actually printed
+// 与旧版 _vsnprintf 不同，本包装保证目标缓冲区以 NUL 结尾。
 int my_snprintf(char* buffer, size_t limit, const char* format, ...)
 {
     if (limit == 0)
@@ -121,6 +145,7 @@ int my_snprintf(char* buffer, size_t limit, const char* format, ...)
 }
 
 
+// printf 风格生成 std::string；固定栈缓冲不足时逐倍扩容。
 string strprintf(const char* format, ...)
 {
     char buffer[50000];
@@ -154,6 +179,7 @@ string strprintf(const char* format, ...)
 }
 
 
+// 统一输出带 ERROR 前缀的消息并返回 false，便于错误路径直接返回。
 bool error(const char* format, ...)
 {
     char buffer[50000];
@@ -172,6 +198,7 @@ bool error(const char* format, ...)
 }
 
 
+// 打印异常上下文；GUI 存在时弹出错误框，随后重新抛出当前异常。
 void PrintException(std::exception* pex, const char* pszThread)
 {
     char pszModule[260];
@@ -193,6 +220,7 @@ void PrintException(std::exception* pex, const char* pszThread)
 }
 
 
+// 按单个分隔字符切分，并保留空字段。
 void ParseString(const string& str, char c, vector<string>& v)
 {
     unsigned int i1 = 0;
@@ -207,6 +235,7 @@ void ParseString(const string& str, char c, vector<string>& v)
 }
 
 
+// 把最小货币单位转换为带千位分隔和两位小数的界面字符串。
 string FormatMoney(int64 n, bool fPlus)
 {
     n /= CENT;
@@ -221,6 +250,7 @@ string FormatMoney(int64 n, bool fPlus)
     return str;
 }
 
+// 严格解析非负金额：允许规范千位逗号和恰好两位小数，并检查溢出。
 bool ParseMoney(const char* pszIn, int64& nRet)
 {
     string strWhole;
@@ -272,6 +302,7 @@ bool ParseMoney(const char* pszIn, int64& nRet)
 
 
 
+// 轻量文件存在性检查。
 bool FileExists(const char* psz)
 {
 #ifdef WIN32
@@ -281,6 +312,7 @@ bool FileExists(const char* psz)
 #endif
 }
 
+// 暂存当前位置，跳到文件尾测量长度，再恢复原位置。
 int GetFilesize(FILE* file)
 {
     int nSavePos = ftell(file);
@@ -298,6 +330,7 @@ int GetFilesize(FILE* file)
 
 
 
+// 返回 [0,nMax) 的密码学随机整数；拒绝采样消除直接取模造成的分布偏差。
 uint64 GetRand(uint64 nMax)
 {
     if (nMax == 0)
@@ -333,18 +366,22 @@ uint64 GetRand(uint64 nMax)
 //  of other nodes clocks to correct ours.
 //
 
+// 未校正的系统 Unix 时间。
 int64 GetTime()
 {
     return time(NULL);
 }
 
+// 对等节点样本计算出的中位数偏移，仅作用于 GetAdjustedTime。
 static int64 nTimeOffset = 0;
 
+// 节点业务使用的当前时间：系统时间加网络中位数偏移。
 int64 GetAdjustedTime()
 {
     return GetTime() + nTimeOffset;
 }
 
+// 每个 IP 只采一个时间差；样本数达到至少 5 个奇数时更新中位数偏移。
 void AddTimeData(unsigned int ip, int64 nTime)
 {
     int64 nOffsetSample = nTime - GetTime();

@@ -1,31 +1,54 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// script.h — Bitcoin v0.1.3 脚本语言的数据结构与接口
+//=============================================================================
+//
+// 【本文件功能】
+//   定义交易脚本使用的操作码、签名哈希类型和 CScript 字节码容器，并声明
+//   脚本执行、标准脚本识别、签名生成与签名验证等入口。
+//
+// 【在整个系统中的作用】
+//   1. 交易输出的 scriptPubKey 在这里表达“花费条件”，交易输入的 scriptSig
+//      表达“解锁数据”；两段脚本共同决定某个 UTXO 能否被本次输入花费。
+//   2. main.cpp 校验交易输入时经 VerifySignature 进入脚本解释器；钱包创建交易时
+//      经 SignSignature/Solver 识别标准模板并生成对应的解锁脚本。
+//   3. SignatureHash 按 SIGHASH 规则选择交易承诺范围，因此脚本字节布局和哈希
+//      规则会直接影响交易有效性，属于所有节点必须一致执行的共识逻辑。
+//
+// 【阅读提示】
+//   opcodetype → 字节码指令集；CScript → 构造/解析脚本；EvalScript → 执行；
+//   Solver → 识别标准付款模板；SignSignature / VerifySignature → 钱包与验证入口。
+//
+//=============================================================================
 
 class CTransaction;
 
+// 签名哈希类型：低 5 位选择承诺哪些输出，最高位可把输入范围缩为当前输入。
 enum
 {
-    SIGHASH_ALL = 1,
-    SIGHASH_NONE = 2,
-    SIGHASH_SINGLE = 3,
-    SIGHASH_ANYONECANPAY = 0x80,
+    SIGHASH_ALL = 1,             // 承诺全部输出（普通交易的默认模式）
+    SIGHASH_NONE = 2,            // 不承诺任何输出，其他人可重新安排收款方
+    SIGHASH_SINGLE = 3,          // 只承诺与当前输入下标相同的那个输出
+    SIGHASH_ANYONECANPAY = 0x80, // 只承诺当前输入，可与上述三种模式按位组合
 };
 
 
 
 enum opcodetype
 {
-    // push value
+    // 压栈类：把紧随其后的字节串或小整数放入主栈，是 scriptSig 提供参数的基础。
     OP_0=0,
-    OP_FALSE=OP_0,
-    OP_PUSHDATA1=76,
+    OP_FALSE=OP_0,       // 空字节串，同时表示假
+    OP_PUSHDATA1=76,     // 后 1 字节给出数据长度
     OP_PUSHDATA2,
-    OP_PUSHDATA4,
-    OP_1NEGATE,
+    OP_PUSHDATA4,        // 分别用后 2/4 字节给出数据长度
+    OP_1NEGATE,          // 压入 -1
     OP_RESERVED,
     OP_1,
-    OP_TRUE=OP_1,
+    OP_TRUE=OP_1,        // OP_1～OP_16 以单操作码压入常用小整数
     OP_2,
     OP_3,
     OP_4,
@@ -42,20 +65,20 @@ enum opcodetype
     OP_15,
     OP_16,
 
-    // control
-    OP_NOP,
-    OP_VER,
-    OP_IF,
+    // 控制流：实现无循环的条件分支和显式失败；vfExec 记录嵌套分支状态。
+    OP_NOP,              // 空操作
+    OP_VER,              // 压入当前客户端协议版本（早期版本特有）
+    OP_IF,               // 按栈顶真假选择分支
     OP_NOTIF,
-    OP_VERIF,
+    OP_VERIF,            // 早期按版本比较进行条件执行的操作码
     OP_VERNOTIF,
     OP_ELSE,
     OP_ENDIF,
-    OP_VERIFY,
-    OP_RETURN,
+    OP_VERIFY,           // 要求栈顶为真，否则使脚本失败
+    OP_RETURN,           // 立即结束执行；由于不压入真值，通常导致失败
 
-    // stack ops
-    OP_TOALTSTACK,
+    // 栈操作：在主栈/备用栈间移动、复制、删除或重排元素，不解释元素内容。
+    OP_TOALTSTACK,       // 主栈顶移入备用栈
     OP_FROMALTSTACK,
     OP_2DROP,
     OP_2DUP,
@@ -75,24 +98,24 @@ enum opcodetype
     OP_SWAP,
     OP_TUCK,
 
-    // splice ops
-    OP_CAT,
+    // 字节串操作：拼接、截取或取得长度；操作对象仍是栈中的原始字节向量。
+    OP_CAT,              // 拼接两个字节串
     OP_SUBSTR,
     OP_LEFT,
     OP_RIGHT,
-    OP_SIZE,
+    OP_SIZE,             // 保留原值并把其字节长度压栈
 
-    // bit logic
+    // 位逻辑与相等比较：逐字节运算，或比较两个栈元素的完整字节表示。
     OP_INVERT,
     OP_AND,
     OP_OR,
     OP_XOR,
-    OP_EQUAL,
-    OP_EQUALVERIFY,
+    OP_EQUAL,            // 字节级相等，结果压栈
+    OP_EQUALVERIFY,      // 相等后立即 VERIFY，P2PKH 模板使用它校验公钥哈希
     OP_RESERVED1,
     OP_RESERVED2,
 
-    // numeric
+    // 数值运算：把栈元素按 CBigNum 编码解释，执行一元/二元算术与比较。
     OP_1ADD,
     OP_1SUB,
     OP_2MUL,
@@ -122,28 +145,28 @@ enum opcodetype
     OP_MIN,
     OP_MAX,
 
-    OP_WITHIN,
+    OP_WITHIN,           // 判断 min <= x < max
 
-    // crypto
+    // 密码学操作：哈希数据、划定签名脚本片段、验证单签或多签。
     OP_RIPEMD160,
     OP_SHA1,
     OP_SHA256,
-    OP_HASH160,
-    OP_HASH256,
-    OP_CODESEPARATOR,
-    OP_CHECKSIG,
+    OP_HASH160,          // SHA256 后 RIPEMD160，标准 P2PKH 公钥摘要使用
+    OP_HASH256,          // 双 SHA256
+    OP_CODESEPARATOR,    // 签名哈希只取最近分隔符之后的 scriptCode
+    OP_CHECKSIG,         // 用公钥验证交易签名，结果真假压栈
     OP_CHECKSIGVERIFY,
-    OP_CHECKMULTISIG,
+    OP_CHECKMULTISIG,    // 按顺序用多个公钥匹配多个签名
     OP_CHECKMULTISIGVERIFY,
 
 
-    // multi-byte opcodes
+    // 操作码编码边界：普通操作码占 1 字节，实验性扩展操作码可占 2 字节。
     OP_SINGLEBYTE_END = 0xF0,
     OP_DOUBLEBYTE_BEGIN = 0xF000,
 
-    // template matching params
-    OP_PUBKEY,
-    OP_PUBKEYHASH,
+    // Solver 专用模板占位符，不是由 EvalScript 执行的真实交易操作码。
+    OP_PUBKEY,           // 匹配一段完整公钥数据
+    OP_PUBKEYHASH,       // 匹配 20 字节公钥哈希
 
 
 
@@ -157,6 +180,7 @@ enum opcodetype
 
 
 
+// 把操作码转换为便于日志和脚本反汇编显示的名称。
 inline const char* GetOpName(opcodetype opcode)
 {
     switch (opcode)
@@ -295,6 +319,7 @@ inline const char* GetOpName(opcodetype opcode)
 
 
 
+// 调试显示：短字节串按脚本数字解释，较长数据以十六进制显示。
 inline string ValueString(const vector<unsigned char>& vch)
 {
     if (vch.size() <= 4)
@@ -304,6 +329,7 @@ inline string ValueString(const vector<unsigned char>& vch)
         //return string("(") + HexStr(vch.begin(), vch.end()) + string(")");
 }
 
+// 把整个执行栈格式化为一行，供调试跟踪使用。
 inline string StackString(const vector<vector<unsigned char> >& vStack)
 {
     string str;
@@ -324,9 +350,13 @@ inline string StackString(const vector<vector<unsigned char> >& vStack)
 
 
 
+// CScript 是脚本的原始字节码容器。
+// 它继承 vector<unsigned char>，既能直接序列化进交易，也提供 << 构造指令、
+// GetOp 顺序解码、FindAndDelete 准备签名哈希以及 ToString 反汇编等能力。
 class CScript : public vector<unsigned char>
 {
 protected:
+    // 按脚本数字规则压入有符号整数；-1 和 1～16 使用专用短操作码。
     CScript& push_int64(int64 n)
     {
         if (n == -1 || (n >= 1 && n <= 16))
@@ -341,6 +371,7 @@ protected:
         return (*this);
     }
 
+    // 无符号整数版本；不能用短操作码时转成 CBigNum 字节表示再压栈。
     CScript& push_uint64(uint64 n)
     {
         if (n == -1 || (n >= 1 && n <= 16))
@@ -405,6 +436,7 @@ public:
     CScript& operator<<(unsigned long b)  { return (push_uint64(b)); }
     CScript& operator<<(uint64 b)         { return (push_uint64(b)); }
 
+    // 追加一条操作码；早期实现同时保留了双字节扩展操作码编码。
     CScript& operator<<(opcodetype opcode)
     {
         if (opcode <= OP_SINGLEBYTE_END)
@@ -420,6 +452,7 @@ public:
         return (*this);
     }
 
+    // 固定宽度哈希也作为“长度前缀 + 原始字节”的压栈数据写入脚本。
     CScript& operator<<(const uint160& b)
     {
         insert(end(), sizeof(b));
@@ -440,6 +473,7 @@ public:
         return (*this);
     }
 
+    // 追加一段压栈数据，并按长度自动选择直接长度、PUSHDATA1 或 PUSHDATA2。
     CScript& operator<<(const vector<unsigned char>& b)
     {
         if (b.size() < OP_PUSHDATA1)
@@ -470,6 +504,7 @@ public:
     }
 
 
+    // 可写迭代器包装：复用 const 解析实现，并把更新后的位置映射回来。
     bool GetOp(iterator& pc, opcodetype& opcodeRet, vector<unsigned char>& vchRet)
     {
          // This is why people hate C++
@@ -479,6 +514,8 @@ public:
          return fRet;
     }
 
+    // 从 pc 解码一条指令；若为压栈指令，同时返回其数据并推进 pc。
+    // 遇到截断的操作码、长度字段或载荷时返回 false，防止越界读取。
     bool GetOp(const_iterator& pc, opcodetype& opcodeRet, vector<unsigned char>& vchRet) const
     {
         opcodeRet = OP_INVALIDOPCODE;
@@ -532,6 +569,7 @@ public:
     }
 
 
+    // 仅在指令边界查找并删除字节序列；签名哈希前用它移除签名自身和 CODESEPARATOR。
     void FindAndDelete(const CScript& b)
     {
         iterator pc = begin();
@@ -556,6 +594,7 @@ public:
         printf("CScript(%s)\n", HexStr(begin(), end()).c_str());
     }
 
+    // 顺序反汇编脚本：压栈项显示值，其他指令显示操作码名称。
     string ToString() const
     {
         string str;
@@ -587,11 +626,16 @@ public:
 
 
 
+// 执行脚本并以最终主栈栈顶真假作为结果；可选返回执行后的栈。
 bool EvalScript(const CScript& script, const CTransaction& txTo, unsigned int nIn, int nHashType=0,
                 vector<vector<unsigned char> >* pvStackRet=NULL);
+// 构造当前输入要签名/验证的交易副本，并按 SIGHASH 模式计算双 SHA256。
 uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsigned int nIn, int nHashType);
+// 以下辅助接口由 Solver 识别本版本支持的标准 P2PK/P2PKH 输出。
 bool IsMine(const CScript& scriptPubKey);
 bool ExtractPubKey(const CScript& scriptPubKey, bool fMineOnly, vector<unsigned char>& vchPubKeyRet);
 bool ExtractHash160(const CScript& scriptPubKey, uint160& hash160Ret);
+// 钱包签名入口：为 txTo 的第 nIn 个输入生成 scriptSig。
 bool SignSignature(const CTransaction& txFrom, CTransaction& txTo, unsigned int nIn, int nHashType=SIGHASH_ALL, CScript scriptPrereq=CScript());
+// 交易验证入口：确认 prevout 指向 txFrom 后，执行 scriptSig + scriptPubKey。
 bool VerifySignature(const CTransaction& txFrom, const CTransaction& txTo, unsigned int nIn, int nHashType=0);

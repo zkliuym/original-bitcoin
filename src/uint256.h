@@ -1,6 +1,25 @@
 // Copyright (c) 2009 Satoshi Nakamoto
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
+//
+//=============================================================================
+// uint256.h — 固定宽度 160/256 位无符号整数
+//=============================================================================
+//
+// 【本文件功能】
+//   提供按 32 位字分块存储的 base_uint，以及具体的 uint160、uint256 类型；
+//   支持位运算、加减、移位、比较、十六进制转换和原始字节序列化。
+//
+// 【在整个系统中的作用】
+//   uint256 是交易哈希、区块哈希、Merkle 节点和工作量目标等核心值的载体；
+//   uint160 主要承载公钥的 SHA256+RIPEMD160 摘要，并进一步生成地址。
+//   这些类型是“固定 20/32 字节值”，不是任意精度运算库；复杂大数运算见 bignum.h。
+//
+// 【阅读提示】
+//   pn[0] 保存最低 32 位，内存中按小端字序排列；GetHex/SetHex 面向人类常见的
+//   高位在前十六进制文本。直接 Serialize 时则原样写出 pn 的内存字节。
+//
+//=============================================================================
 
 #include <limits.h>
 #include <string>
@@ -22,11 +41,14 @@ inline int Testuint256AdHoc(vector<string> vArg);
 
 // We have to keep a separate base class without constructors
 // so the compiler will let us use it in a union
+// 固定宽度整数的公共实现。刻意不定义构造函数，使该基类仍可放入 union；
+// WIDTH 是 32 位字数量，pn 从低位字到高位字排列。
 template<unsigned int BITS>
 class base_uint
 {
 protected:
     enum { WIDTH=BITS/32 };
+    // 数值本体；pn[0] 为最低有效 32 位。
     unsigned int pn[WIDTH];
 public:
 
@@ -107,6 +129,7 @@ public:
         return *this;
     }
 
+    // 固定宽度逻辑左移；移出的高位直接丢弃。
     base_uint& operator<<=(unsigned int shift)
     {
         base_uint a(*this);
@@ -124,6 +147,7 @@ public:
         return *this;
     }
 
+    // 固定宽度逻辑右移；左侧补零。
     base_uint& operator>>=(unsigned int shift)
     {
         base_uint a(*this);
@@ -141,6 +165,7 @@ public:
         return *this;
     }
 
+    // 逐 32 位字相加并传播进位；超出 BITS 的最终进位被截断。
     base_uint& operator+=(const base_uint& b)
     {
         uint64 carry = 0;
@@ -291,6 +316,7 @@ public:
 
 
 
+    // 生成固定长度、高位在前的十六进制文本，便于日志和 RPC 展示。
     std::string GetHex() const
     {
         char psz[sizeof(pn)*2 + 1];
@@ -299,6 +325,7 @@ public:
         return string(psz, psz + sizeof(pn)*2);
     }
 
+    // 从可带空白及 0x 前缀的十六进制文本解析；超过宽度的高位被忽略。
     void SetHex(const std::string& str)
     {
         for (int i = 0; i < WIDTH; i++)
@@ -337,6 +364,7 @@ public:
         return (GetHex());
     }
 
+    // 暴露底层连续字节范围，供哈希、地址编码和序列化代码使用。
     unsigned char* begin()
     {
         return (unsigned char*)&pn[0];
@@ -353,6 +381,7 @@ public:
     }
 
 
+    // 固定宽度类型始终按原始 pn 字节序列化，不带长度前缀。
     unsigned int GetSerializeSize(int nType=0, int nVersion=VERSION) const
     {
         return sizeof(pn);
@@ -394,6 +423,8 @@ typedef base_uint<256> base_uint256;
 // uint160
 //
 
+// 160 位具体类型：主要用于 Hash160 公钥摘要和地址负载。
+// 构造接口负责把基类结果、整数、十六进制文本或恰好 20 字节的向量装入固定宽度值。
 class uint160 : public base_uint160
 {
 public:
@@ -506,6 +537,8 @@ inline const uint160 operator-(const uint160& a, const uint160& b)      { return
 // uint256
 //
 
+// 256 位具体类型：Bitcoin 中哈希值、目标值和各种对象标识的标准容器。
+// 它继承 base_uint 的定宽算术；不要把显示时的十六进制顺序与内存字节顺序混淆。
 class uint256 : public base_uint256
 {
 public:
@@ -619,6 +652,8 @@ inline const uint256 operator-(const uint256& a, const uint256& b)      { return
 
 
 
+// 早期开发期保留的手工测试入口，逐项打印递增、移位、按位运算和文本解析结果；
+// 不参与节点正常业务流程。
 inline int Testuint256AdHoc(vector<string> vArg)
 {
     uint256 g(0);
